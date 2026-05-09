@@ -1,60 +1,66 @@
-# ReAct 智能体重构计划
+# F:\Agent_bio_react 全新 ReAct 智能体计划
 
 ## Summary
-- 重做为通用 ReAct 多任务框架：任务流程从 Python 固定步骤迁移到 Markdown 任务文档，运行时由智能体检索任务说明、观察界面、选择工具、验证结果，直到任务完成或失败退出。
-- 执行采用“受控自主”：智能体可决定下一步，但只能调用白名单工具；每个动作后必须截图验证，不能只相信模型返回坐标。
-- 训练阶段只生成候选记忆；运行结束后批量人工审核，审核通过后才进入正式记忆库。正式运行时记忆只作为提示和约束，不能直接绕过当前截图验证。
-- ReAct 推理模型首版不绑定具体供应商，只保留 `Reasoner` 接口；视觉理解工具继续使用现有 Qwen/GLM provider。
+- 新智能体根目录固定为 `F:\Agent_bio_react`，该文件夹已存在。
+- 新智能体在 `F:\Agent_bio_react` 中从零实现，不放在旧项目目录下，不改造旧固定流程代码。
+- 当前仓库必须自包含运行逻辑；不导入旧项目代码，不读取旧项目配置或 API 文件。
 
 ## Key Changes
-- 新增通用任务文档格式：`YAML frontmatter + Markdown`。
-  - YAML 固定字段：`id`、`title`、`description`、`inputs`、`allowed_tools`、`start_conditions`、`success_criteria`、`safety_rules`。
-  - Markdown 固定章节：任务目标、关键界面状态、推荐里程碑、常见错误、完成判据。
-  - 任务文档不得写死坐标，只能描述目标、约束、验证标准和允许动作。
+- 新目录结构：
+  - `F:\Agent_bio_react\tasks\`：任务 Markdown 文档，采用 `YAML frontmatter + Markdown`。
+  - `F:\Agent_bio_react\agent\`：ReAct loop、状态机、Reasoner 接口、任务加载器。
+  - `F:\Agent_bio_react\tools\`：受控工具白名单，封装截图、窗口连接、点击、输入、拖拽、等待、视觉定位/验证。
+  - `F:\Agent_bio_react\modules\vision\`：视觉验证层在本仓库内独立实现，优先使用当前仓库的 API key 配置。
+  - `F:\Agent_bio_react\memory\`：SQLite 记忆库、候选记忆、审核和检索逻辑。
+  - `F:\Agent_bio_react\data\`：运行数据，默认存放 `memory.sqlite3`。
+  - `F:\Agent_bio_react\tests\`：单元测试和 mock 集成测试。
+  - `F:\Agent_bio_react\run_agent.py`：新入口。
 
-- 新增 ReAct 引擎，而不是继续使用 `tasks/biopharma_protein.py` 的固定 `STEPS`。
-  - 循环结构固定为：`Observe -> Retrieve Memory -> Reason -> Act -> Verify -> Record Candidate`。
-  - `Observe` 负责截图、窗口信息、当前状态摘要。
-  - `Reason` 输出结构化 JSON 决策：下一动作、目标描述、期望变化、失败回退策略。
-  - `Act` 只能调用工具白名单：窗口连接、截图、视觉定位/验证、点击、双击、拖拽、输入文本、按键、滚动、等待。
-  - `Verify` 必须基于新截图判断动作是否达到预期；验证失败时进入修正回合，而不是继续盲跑。
+- 独立运行边界：
+  - 桌面执行层直接使用当前环境安装的 `maa` 包。
+  - 桌面执行配置使用本仓库 `config/settings.yaml`。
+  - API key 只来自环境变量或本仓库 `API.txt`。
+  - 不导入旧项目模块，不把旧项目路径加入 `sys.path`，不读取旧项目配置。
 
-- 新增模型无关接口。
-  - `Reasoner`：只定义输入输出协议，不绑定具体模型。
-  - 默认实现为 `ManualReasoner` 或 `NullReasoner`：用于验证框架和接口；后续可接任意文本/多模态模型。
-  - `VisionProvider` 继续作为工具存在，优先级沿用：Qwen3-VL-Flash -> GLM-4.6V-Flash -> 临时 YAML。
+- 新任务文档格式：
+  - YAML 字段：`id`、`title`、`description`、`inputs`、`allowed_tools`、`start_conditions`、`success_criteria`、`safety_rules`。
+  - Markdown 章节：任务目标、关键界面状态、推荐里程碑、常见错误、完成判据。
+  - 不允许写死坐标；只能描述目标、约束、验证标准和允许动作。
+  - 首个任务文档放在 `F:\Agent_bio_react\tasks\biopharma_protein.md`。
 
-- 新增 SQLite 记忆库。
-  - 表：`episodes`、`steps`、`memory_candidates`、`approved_memories`。
-  - 训练运行写入候选记忆，包括截图路径、观察摘要、动作、动作结果、验证结果、错误原因。
-  - 批量审核命令将候选记忆标记为 approved/rejected。
-  - 正式运行只检索 approved 记忆，并要求当前截图验证通过后才能执行动作。
+- ReAct loop：
+  - 固定循环：`Observe -> Retrieve Memory -> Reason -> Act -> Verify -> Record Candidate`。
+  - `Reasoner` 首版只定义接口，不绑定具体模型；可先用 `ManualReasoner` 或 mock reasoner 验证框架。
+  - `Act` 只能调用任务文档 `allowed_tools` 中声明的工具。
+  - 每个动作后必须截图并验证状态变化；验证失败进入修正回合或安全退出。
 
-- 完全重写运行入口。
-  - 新入口加载任务 md、创建 ReAct 引擎、连接工具、执行任务。
-  - 旧固定流程不再作为运行 fallback；旧文件可暂时保留作参考和对照，但新入口不依赖 `tasks/biopharma_protein.py`。
+- 记忆系统：
+  - SQLite 文件默认放在 `F:\Agent_bio_react\data\memory.sqlite3`。
+  - 训练模式写入候选记忆，不直接固化。
+  - 审核命令批量批准/拒绝候选记忆。
+  - 正式模式只使用 approved 记忆，并且必须结合当前截图验证，不能直接复用坐标。
 
 ## Test Plan
 - 单元测试：
-  - 任务 Markdown frontmatter 解析、必填字段校验、非法工具拒绝。
-  - `Reasoner` 输出 JSON schema 校验：非法动作、缺少验证目标、越权工具调用必须失败。
-  - 工具层 dry-run/mock：点击、输入、截图、视觉定位、验证动作均返回统一 `ToolResult`。
-  - SQLite 记忆：候选写入、审核流转、approved 检索、rejected 不参与检索。
+  - 任务 Markdown 解析和必填字段校验。
+  - 工具白名单权限校验。
+  - `Reasoner` 输出 schema 校验。
+  - SQLite 候选记忆写入、审核、正式检索。
+  - Qwen provider mock 调用和 fallback 顺序。
 
 - 集成测试：
-  - 使用 mock 界面截图和 mock reasoner 跑完整 ReAct loop。
-  - 复现 Qwen 点错 `Oligonucleotide Analysis` 的案例：验证器必须识别页面错误，并要求修正。
-  - 训练模式生成候选记忆，批量审核后正式模式能检索并使用该经验。
-  - 正式模式中，即使记忆推荐旧坐标，也必须在当前截图验证目标文本/区域正确后才点击。
+  - 使用 mock screenshot + mock reasoner 跑完整 ReAct loop。
+  - 模拟点错 `Oligonucleotide Analysis`：验证器必须发现页面错误，不允许继续任务。
+  - 训练模式生成候选记忆，审核后正式模式可检索使用。
+  - 正式模式中，记忆推荐动作仍必须通过当前截图验证。
 
 - 实机验收：
-  - 用新的任务 md 执行 BioPharma 蛋白任务。
+  - 从 `F:\Agent_bio_react\run_agent.py` 启动 BioPharma 蛋白任务。
   - 成功条件：最终进入 Deconvoluted Spectrum 页面，并完成最高峰拖拽。
-  - 失败条件：点错任务入口、文件窗口未出现、验证结果不一致时必须停止或修正，不能误报成功。
+  - 失败条件：目标窗口不存在、点错入口、文件窗口未出现、验证不一致时必须明确报错，不能误报成功。
 
 ## Assumptions
-- 首版目标是通用多任务框架，不只服务蛋白任务。
-- 执行策略是受控自主，不允许模型自由调用任意 Win32/API。
-- 推理模型暂不绑定，只保留接口；视觉理解仍可使用现有 Qwen/GLM。
-- 记忆必须审核后固化；正式运行使用记忆作为提示和反例，不直接复用未验证坐标。
-- 新 ReAct 入口完全重写，不以旧 Python 固定流程作为 fallback。
+- 新智能体根路径固定为 `F:\Agent_bio_react`。
+- 新智能体完全独立于旧固定流程入口和旧项目配置。
+- 不复用旧项目中配置的 API Key 或旧桌面适配器。
+- 推理模型暂时空置，只留接口；视觉模型继续优先使用 Qwen。

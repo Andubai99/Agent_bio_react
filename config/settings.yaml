@@ -1,0 +1,6 @@
+win32:
+  screencap_method: Background
+  mouse_method: Seize
+  keyboard_method: Seize
+  screenshot_use_raw_size: true
+  screenshot_target_long_side: 0
