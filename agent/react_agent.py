@@ -10,7 +10,7 @@ from agent.runtime_logger import (
     summarize_observation,
     summarize_tool_result,
 )
-from agent.task_parser import parse_task_body, parse_window_transition
+from agent.task_parser import parse_action_sequence, parse_task_body, parse_window_transition
 from agent.types import AgentRunResult, ImageInfo, Observation, StepOutcome, TaskSpec, ToolResult
 from modules.reasoner import Reasoner, ReasonerContext
 from modules.ui_parser.omniparser import OmniParserClient
@@ -93,9 +93,11 @@ class ReActAgent:
 
             current_step = task_steps[current_instruction_index]
             window_transition = parse_window_transition(current_step.window_text, parsed_task.window_definitions)
+            action_sequence_hint = parse_action_sequence(current_step.action_text)
             current_task = _task_with_current_instruction(
                 self.task,
                 current_instruction=current_step.action_text,
+                action_sequence_hint=action_sequence_hint,
                 current_index=current_instruction_index,
                 total=len(task_steps),
             )
@@ -106,6 +108,7 @@ class ReActAgent:
                     "index": current_instruction_index + 1,
                     "total": len(task_steps),
                     "action": current_step.action_text,
+                    "action_sequence_hint": action_sequence_hint,
                     "window": current_step.window_text,
                     "verification": current_step.verification_text,
                     "window_transition": window_transition,
@@ -114,6 +117,7 @@ class ReActAgent:
             window_ready = self.desktop.sync_after_action(
                 expected_title_keywords=_source_window_titles(window_transition),
                 settle_seconds=0.0,
+                timeout_seconds=0.0,
                 allow_foreground_switch=False,
             )
             self.logger.log("观察前窗口上下文检查结果", summarize_tool_result(window_ready))
@@ -189,11 +193,12 @@ class ReActAgent:
                         continue
                 return AgentRunResult(False, verification.code, verification.message, steps)
 
-            if decision.action is None:
+            actions = _actions_from_decision(decision)
+            if not actions:
                 return AgentRunResult(
                     False,
                     "NO_ACTION",
-                    "Reasoner did not provide an action.",
+                    "Reasoner did not provide any action.",
                     steps,
                 )
 
@@ -203,18 +208,19 @@ class ReActAgent:
                 height=observation.image_size[1],
                 resolution=observation.resolution,
             )
-            decision = self._redirect_to_synthetic_target_if_needed(
-                decision,
+            actions = self._redirect_actions_to_synthetic_targets_if_needed(
+                actions,
                 observation=observation,
                 task_instruction=_ui_parser_context(current_step.action_text, current_step.verification_text),
             )
-            self.logger.log("准备执行动作", decision.action)
-            action_result = self.desktop.execute_action(
-                decision.action,
+            decision = replace(decision, action=actions[0], actions=actions)
+            self.logger.log("准备执行动作序列", actions)
+            action_result = self._execute_action_sequence(
+                actions=actions,
                 elements=observation.elements,
                 screenshot=before_screenshot,
             )
-            self.logger.log("动作执行结果", summarize_tool_result(action_result))
+            self.logger.log("动作序列执行结果", summarize_tool_result(action_result))
             if not action_result.ok:
                 outcome = StepOutcome(index, observation, decision, action_result, None)
                 steps.append(outcome)
@@ -242,7 +248,7 @@ class ReActAgent:
                 current_index=current_instruction_index,
                 total=len(task_steps),
             )
-            page_change = self._detect_page_change(before_screenshot, post_screenshot, action=decision.action)
+            page_change = self._detect_page_change(before_screenshot, post_screenshot, action=actions[-1])
             self.logger.log("页面变化判断结果", page_change.to_dict())
             verification = _local_window_transition_verification(
                 window_transition,
@@ -328,24 +334,86 @@ class ReActAgent:
         )
         return local_result
 
-    def _redirect_to_synthetic_target_if_needed(
+    def _execute_action_sequence(
         self,
-        decision,
+        *,
+        actions: list,
+        elements: list,
+        screenshot: ImageInfo,
+    ) -> ToolResult:
+        results: list[dict] = []
+        for sequence_index, action in enumerate(actions, start=1):
+            self.logger.log(
+                "执行动作序列项",
+                {
+                    "sequence_index": sequence_index,
+                    "total": len(actions),
+                    "action": action,
+                },
+            )
+            result = self.desktop.execute_action(
+                action,
+                elements=elements,
+                screenshot=screenshot,
+            )
+            self.logger.log("动作序列项执行结果", summarize_tool_result(result))
+            results.append(
+                {
+                    "sequence_index": sequence_index,
+                    "action": action,
+                    "result": summarize_tool_result(result),
+                }
+            )
+            if not result.ok:
+                return ToolResult(
+                    False,
+                    result.code,
+                    result.message,
+                    data={
+                        "failed_sequence_index": sequence_index,
+                        "action_results": results,
+                    },
+                )
+
+        return ToolResult(
+            True,
+            "ACTION_SEQUENCE_EXECUTED",
+            f"Executed {len(actions)} action(s).",
+            data={"action_results": results},
+        )
+
+    def _redirect_actions_to_synthetic_targets_if_needed(
+        self,
+        actions: list,
+        *,
+        observation: Observation,
+        task_instruction: str,
+    ) -> list:
+        return [
+            self._redirect_action_to_synthetic_target_if_needed(
+                action,
+                observation=observation,
+                task_instruction=task_instruction,
+            )
+            for action in actions
+        ]
+
+    def _redirect_action_to_synthetic_target_if_needed(
+        self,
+        action,
         *,
         observation: Observation,
         task_instruction: str,
     ):
-        action = decision.action
-        if action is None or action.type.strip().lower() not in {"click", "double_click", "input_text"}:
-            return decision
-
+        if action.type.strip().lower() not in {"click", "double_click", "input_text"}:
+            return action
         synthetic = self.ui_parser.synthetic_target_for_instruction(
             observation.elements,
             selected_idx=action.element_idx,
             task_instruction=task_instruction,
         )
         if synthetic is None or synthetic.idx == action.element_idx:
-            return decision
+            return action
 
         redirected_action = replace(
             action,
@@ -367,11 +435,7 @@ class ReActAgent:
                 "to_center": synthetic.center,
             },
         )
-        return replace(
-            decision,
-            thought=f"{decision.thought} Synthetic target redirect applied to {synthetic.content}.",
-            action=redirected_action,
-        )
+        return redirected_action
 
     def _verify_after_action(
         self,
@@ -532,6 +596,14 @@ def _attach_page_change_result(verification: ToolResult, page_change: PageChange
     verification.data["page_change_local_decisive"] = page_change.local_decisive
 
 
+def _actions_from_decision(decision) -> list:
+    actions = list(getattr(decision, "actions", []) or [])
+    if actions:
+        return actions
+    action = getattr(decision, "action", None)
+    return [action] if action is not None else []
+
+
 def _local_window_transition_verification(
     window_transition,
     *,
@@ -645,15 +717,33 @@ def _task_with_current_instruction(
     task: TaskSpec,
     *,
     current_instruction: str,
+    action_sequence_hint: list,
     current_index: int,
     total: int,
 ) -> TaskSpec:
     position = current_index + 1
+    inputs = {
+        **task.inputs,
+        "current_instruction": current_instruction,
+        "current_instruction_index": position,
+        "current_instruction_total": total,
+        "action_sequence_hint": [
+            {
+                "order": hint.order,
+                "action": hint.action,
+                "target_hint": hint.target_hint,
+                "text": hint.text,
+                "raw": hint.raw,
+            }
+            for hint in action_sequence_hint
+        ],
+    }
     return replace(
         task,
         id=f"{task.id}:step_{position}",
         title=f"{task.title} ({position}/{total})",
         body=f"当前任务指示（{position}/{total}）：{current_instruction}",
+        inputs=inputs,
     )
 
 

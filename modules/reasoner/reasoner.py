@@ -69,7 +69,11 @@ class ManualReasoner:
         print("\n--- OmniParser 元素 ---")
         for element in context.observation.elements[:120]:
             print(f"{element.idx}: content={element.text!r} center={element.center} bbox={element.pixel_bbox}")
-        print('\n请输入 JSON，例如：{"action":"input_text","index":9,"coordinate":[321,401],"text":"BioPharma test demo1"}')
+        print(
+            '\n请输入 JSON，例如：'
+            '{"actions":[{"action":"click","index":9,"coordinate":[321,401],"text":null},'
+            '{"action":"input_text","index":9,"coordinate":[321,401],"text":"BioPharma test demo1"}]}'
+        )
         raw = input("> ")
         parsed = json.loads(raw)
         return _decision_from_index_coordinate(parsed, context, model_name="manual")
@@ -222,11 +226,18 @@ class DeepSeekReasoner:
 def _system_prompt() -> str:
     return (
         "你是桌面智能体的元素选择器。"
-        "你只能根据用户输入中的 task 和 omniparser_json 选择一个最可能要交互的元素。"
+        "你只能根据用户输入中的 task、action_sequence_hint 和 omniparser_json 选择下一步要交互的元素。"
         "不要使用其他信息，不要解释，不要输出 Markdown。"
-        "严格只返回一个 JSON 对象，并且只能包含这四个字段："
-        '{"action":"表示下一步动作","index":序号,"coordinate":[x,y],"text":文本或null}。'
-        "action 字段用于描述下一步动作，不强制固定取值。"
+        "严格只返回一个 JSON 对象，并且只能包含 actions 这一个顶层字段："
+        '{"actions":[{"action":"表示下一步动作","index":序号,"coordinate":[x,y],"text":文本或null}]}。'
+        "禁止返回旧格式 {\"action\":...}；即使只有一个动作，也必须放在 actions 数组里。"
+        "actions 可以包含任意数量的动作对象，必须按 task 原文语序和 action_sequence_hint 的 order 排列，执行器会按数组顺序逐个执行。"
+        "如果 action_sequence_hint 不为空，通常 actions 的数量和顺序应与它一致。"
+        "action_sequence_hint 是 Agent 根据任务语句解析出的参考动作序列；每个 hint 的 target_hint 用来帮助你在 omniparser_json 中选择对应元素。"
+        "如果 target_hint 指向输入框、选择框、checkbox、input box，应优先选择 content 明确包含这些控件语义的 synthetic 元素。"
+        "例如“点击某输入框并输入某文本”，必须返回两个对象：先 click 对应目标元素，再 input_text 对应同一目标元素和文本。"
+        "例如“点击 A，然后点击 B，再输入 C”，必须返回三个对象。"
+        "每个对象的 action 字段用于描述该步动作，不强制固定取值。"
         "当 action 表示 input_text 或输入文本时，text 必须返回需要输入的文本。"
         "当 action 不是 input_text 或输入文本时，text 必须返回 null。"
         "当前项目执行层支持的可选动作参考值包括："
@@ -237,17 +248,17 @@ def _system_prompt() -> str:
         "press_key=按下键盘按键；"
         "wait=等待；"
         "noop=不执行任何界面动作。"
-        "index 必须来自 omniparser_json[].idx。"
-        "coordinate 必须逐字复制同一个元素的 center 字段。"
+        "每个对象的 index 必须来自 omniparser_json[].idx。"
+        "每个对象的 coordinate 必须逐字复制同一个元素的 center 字段。"
         "禁止编造、估算、修正或转换坐标。"
         "如果当前任务已经完成且无需再点任何元素，返回 "
-        '{"action":"null","index":null,"coordinate":null,"text":null}。'
+        '{"actions":[]}。'
     )
 
 
 def _user_prompt(context: ReasonerContext) -> str:
     payload = {
-        "task": context.task.body,
+        "task": _task_payload(context.task),
         "omniparser_json": [
             {
                 "idx": element.idx,
@@ -260,29 +271,112 @@ def _user_prompt(context: ReasonerContext) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _task_payload(task: TaskSpec) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "current_instruction": task.inputs.get("current_instruction", task.body),
+        "current_instruction_index": task.inputs.get("current_instruction_index"),
+        "current_instruction_total": task.inputs.get("current_instruction_total"),
+        "action_sequence_hint": task.inputs.get("action_sequence_hint", []),
+        "raw_task_body": task.body,
+        "return_format": {
+            "top_level_fields": ["actions"],
+            "action_item_fields": ["action", "index", "coordinate", "text"],
+        },
+    }
+
+
 def _decision_from_index_coordinate(
     parsed: Dict[str, Any],
     context: ReasonerContext,
     *,
     model_name: str,
 ) -> ReasonerDecision:
-    extra_keys = set(parsed) - {"action", "index", "coordinate", "text"}
+    return _decision_from_actions(
+        _normalize_model_response_to_actions(parsed, model_name=model_name),
+        context,
+        model_name=model_name,
+    )
+
+
+def _normalize_model_response_to_actions(parsed: Dict[str, Any], *, model_name: str) -> Dict[str, Any]:
+    if set(parsed) == {"actions"}:
+        return parsed
+
+    legacy_fields = {"action", "index", "coordinate", "text"}
+    if set(parsed) == legacy_fields:
+        if parsed["index"] is None and parsed["coordinate"] is None:
+            return {"actions": []}
+        return {"actions": [parsed]}
+
+    raise RuntimeError(
+        f'{model_name} must return only {{"actions": [...]}}. '
+        "Legacy single-action responses are accepted only as a compatibility fallback."
+    )
+
+
+def _decision_from_actions(
+    parsed: Dict[str, Any],
+    context: ReasonerContext,
+    *,
+    model_name: str,
+) -> ReasonerDecision:
+    extra_keys = set(parsed) - {"actions"}
     if extra_keys:
         raise RuntimeError(f"{model_name} returned extra fields: {sorted(extra_keys)}")
-    if "action" not in parsed or "index" not in parsed or "coordinate" not in parsed or "text" not in parsed:
-        raise RuntimeError(
-            f'{model_name} must return only {{"action": ..., "index": ..., "coordinate": ..., "text": ...}}'
+    raw_actions = parsed["actions"]
+    if not isinstance(raw_actions, list):
+        raise RuntimeError(f'{model_name} must return {{"actions": [...]}}')
+
+    actions: list[AgentAction] = []
+    for sequence_index, raw_action in enumerate(raw_actions, start=1):
+        if not isinstance(raw_action, dict):
+            raise RuntimeError(f"{model_name} actions[{sequence_index}] must be an object")
+        action = _agent_action_from_model_item(
+            raw_action,
+            context,
+            model_name=model_name,
+            sequence_index=sequence_index,
         )
-    raw_action = parsed["action"]
-    if parsed["index"] is None and parsed["coordinate"] is None:
+        if action is not None:
+            actions.append(action)
+
+    if not actions:
         return ReasonerDecision(
             thought=f"{model_name} returned no further element selection.",
             done=True,
         )
 
+    return ReasonerDecision(
+        thought=f"{model_name} selected {len(actions)} action(s).",
+        action=actions[0],
+        actions=actions,
+        expected_observation="",
+    )
+
+
+def _agent_action_from_model_item(
+    item: Dict[str, Any],
+    context: ReasonerContext,
+    *,
+    model_name: str,
+    sequence_index: int,
+) -> AgentAction | None:
+    extra_keys = set(item) - {"action", "index", "coordinate", "text"}
+    if extra_keys:
+        raise RuntimeError(f"{model_name} actions[{sequence_index}] returned extra fields: {sorted(extra_keys)}")
+    if "action" not in item or "index" not in item or "coordinate" not in item or "text" not in item:
+        raise RuntimeError(
+            f'{model_name} action item must contain only {{"action": ..., "index": ..., "coordinate": ..., "text": ...}}'
+        )
+    raw_action = item["action"]
+    if item["index"] is None and item["coordinate"] is None:
+        return None
+
     action_type = _execution_action_from_model_action(raw_action)
-    element_idx = int(parsed["index"])
-    coordinate = parsed["coordinate"]
+    element_idx = int(item["index"])
+    coordinate = item["coordinate"]
     element = next((item for item in context.observation.elements if item.idx == element_idx), None)
     if element is None:
         raise RuntimeError(f"{model_name} selected unknown index={element_idx}.")
@@ -291,18 +385,15 @@ def _decision_from_index_coordinate(
             f"{model_name} coordinate does not match element center for index={element_idx}: "
             f"returned={coordinate}, expected={element.center}"
         )
-    return ReasonerDecision(
-        thought=f"{model_name} selected action={action_type}, index={element_idx}, coordinate={element.center}.",
-        action=AgentAction(
-            type=action_type,
-            element_idx=element_idx,
-            args={
-                "model_action": raw_action,
-                "model_coordinate": list(element.center),
-                **({"text": str(parsed["text"])} if action_type == "input_text" and parsed["text"] is not None else {}),
-            },
-        ),
-        expected_observation="",
+    return AgentAction(
+        type=action_type,
+        element_idx=element_idx,
+        args={
+            "model_action": raw_action,
+            "model_coordinate": list(element.center),
+            "sequence_index": sequence_index,
+            **({"text": str(item["text"])} if action_type == "input_text" and item["text"] is not None else {}),
+        },
     )
 
 
@@ -358,6 +449,8 @@ def _execution_action_from_model_action(value: Any) -> str:
 
 
 def _has_required_decision_fields(parsed: Dict[str, Any]) -> bool:
+    if "actions" in parsed and isinstance(parsed.get("actions"), list):
+        return True
     return "action" in parsed and "index" in parsed and "coordinate" in parsed and "text" in parsed
 
 

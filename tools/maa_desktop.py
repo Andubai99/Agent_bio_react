@@ -32,6 +32,8 @@ class DesktopConfig:
     keyboard_method: str = "Seize"
     screenshot_use_raw_size: bool = True
     screenshot_target_long_side: int = 0
+    window_sync_timeout_seconds: float = 8.0
+    window_sync_poll_interval_seconds: float = 0.25
 
     @classmethod
     def load(cls, path: Path = DEFAULT_DESKTOP_CONFIG) -> "DesktopConfig":
@@ -58,6 +60,18 @@ class DesktopConfig:
                 os.environ.get(
                     "BIO_REACT_SCREENSHOT_TARGET_LONG_SIDE",
                     str(data.get("screenshot_target_long_side", cls.screenshot_target_long_side)),
+                )
+            ),
+            window_sync_timeout_seconds=float(
+                os.environ.get(
+                    "BIO_REACT_WINDOW_SYNC_TIMEOUT_SECONDS",
+                    str(data.get("window_sync_timeout_seconds", cls.window_sync_timeout_seconds)),
+                )
+            ),
+            window_sync_poll_interval_seconds=float(
+                os.environ.get(
+                    "BIO_REACT_WINDOW_SYNC_POLL_INTERVAL_SECONDS",
+                    str(data.get("window_sync_poll_interval_seconds", cls.window_sync_poll_interval_seconds)),
                 )
             ),
         )
@@ -91,6 +105,8 @@ class MaaDesktop:
         *,
         expected_title_keywords: list[str] | None = None,
         settle_seconds: float = 0.25,
+        timeout_seconds: float | None = None,
+        poll_interval_seconds: float | None = None,
         allow_foreground_switch: bool = True,
     ) -> ToolResult:
         if settle_seconds > 0:
@@ -98,34 +114,67 @@ class MaaDesktop:
 
         current = {"hwnd": self.hwnd, "window_title": self.window_title}
         keywords = _normalize_title_keywords(expected_title_keywords or [])
-        windows = list(Toolkit.find_desktop_windows())
-        for keyword in keywords:
-            window = _find_window_by_title_keyword(windows, keyword)
-            if window is None:
-                continue
-            hwnd = int(window.hwnd)
-            if hwnd == self.hwnd:
-                return ToolResult(
-                    True,
-                    "WINDOW_CONTEXT_UNCHANGED",
-                    f"Current window already matches expected title: {window.window_name}",
-                    data={**current, "matched_keyword": keyword, "source": "expected_title"},
+        timeout = self.config.window_sync_timeout_seconds if timeout_seconds is None else max(0.0, timeout_seconds)
+        interval = (
+            self.config.window_sync_poll_interval_seconds
+            if poll_interval_seconds is None
+            else max(0.05, poll_interval_seconds)
+        )
+        deadline = time.time() + timeout
+        attempts = 0
+        last_windows: list[Any] = []
+
+        while True:
+            attempts += 1
+            windows = list(Toolkit.find_desktop_windows())
+            last_windows = windows
+            for keyword in keywords:
+                window = _find_window_by_title_keyword(windows, keyword)
+                if window is None:
+                    continue
+                hwnd = int(window.hwnd)
+                if hwnd == self.hwnd:
+                    return ToolResult(
+                        True,
+                        "WINDOW_CONTEXT_UNCHANGED",
+                        f"Current window already matches expected title: {window.window_name}",
+                        data={
+                            **current,
+                            "matched_keyword": keyword,
+                            "source": "expected_title",
+                            "attempts": attempts,
+                            "waited_seconds": round(max(0.0, time.time() - (deadline - timeout)), 3),
+                        },
+                    )
+                switched = self._connect_window_handle(
+                    hwnd,
+                    window.window_name,
+                    success_code="WINDOW_CONTEXT_SWITCHED",
+                    reason="expected_title",
+                    keyword=keyword,
+                    previous=current,
                 )
-            return self._connect_window_handle(
-                hwnd,
-                window.window_name,
-                success_code="WINDOW_CONTEXT_SWITCHED",
-                reason="expected_title",
-                keyword=keyword,
-                previous=current,
-            )
+                switched.data["attempts"] = attempts
+                switched.data["waited_seconds"] = round(max(0.0, time.time() - (deadline - timeout)), 3)
+                return switched
+
+            if not keywords or time.time() >= deadline:
+                break
+            time.sleep(interval)
 
         if keywords and not allow_foreground_switch and not _title_matches_any(self.window_title, keywords):
             return ToolResult(
                 False,
                 "WINDOW_CONTEXT_EXPECTED_NOT_FOUND",
                 "Expected task window was not found.",
-                data={**current, "expected_title_keywords": keywords},
+                data={
+                    **current,
+                    "expected_title_keywords": keywords,
+                    "attempts": attempts,
+                    "timeout_seconds": timeout,
+                    "poll_interval_seconds": interval,
+                    "visible_window_titles": _window_titles_snapshot(last_windows),
+                },
             )
 
         foreground = _foreground_window_info()
@@ -502,6 +551,15 @@ def _find_window_by_title_keyword(windows: list[Any], keyword: str):
         if lowered in title.lower():
             return window
     return None
+
+
+def _window_titles_snapshot(windows: list[Any], *, limit: int = 80) -> list[str]:
+    titles: list[str] = []
+    for window in windows[:limit]:
+        title = str(getattr(window, "window_name", "")).strip()
+        if title:
+            titles.append(title)
+    return titles
 
 
 def _title_matches_any(title: str | None, keywords: list[str]) -> bool:

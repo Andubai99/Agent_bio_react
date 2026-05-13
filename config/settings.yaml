@@ -4,3 +4,5 @@ win32:
   keyboard_method: Seize
   screenshot_use_raw_size: true
   screenshot_target_long_side: 0
+  window_sync_timeout_seconds: 8.0
+  window_sync_poll_interval_seconds: 0.25

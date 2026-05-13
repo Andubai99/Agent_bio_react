@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
 from agent.react_agent import ReActAgent
@@ -36,7 +35,7 @@ def main() -> int:
     run_parser.add_argument(
         "--summary-only",
         action="store_true",
-        help="Only print the final summary instead of the full step JSON.",
+        help="Deprecated; final output is always a compact summary.",
     )
     run_parser.add_argument(
         "--quiet",
@@ -99,20 +98,7 @@ def _run(args) -> int:
             "steps": len(result.steps),
         },
     )
-    if args.summary_only:
-        print(
-            json.dumps(
-                {
-                    "ok": result.ok,
-                    "code": result.code,
-                    "message": result.message,
-                    "steps": len(result.steps),
-                },
-                ensure_ascii=False,
-            )
-        )
-    else:
-        print(json.dumps(_result_to_dict(result), ensure_ascii=False, indent=2))
+    print(json.dumps(_result_summary_to_dict(result), ensure_ascii=False))
     return 0 if result.ok else 1
 
 
@@ -131,39 +117,17 @@ def _build_reasoner(args, logger=None):
 
 def _print_startup_failure(args, code: str, message: str) -> int:
     payload = {"ok": False, "code": code, "message": message, "steps": 0}
-    if args.summary_only:
-        print(json.dumps(payload, ensure_ascii=False))
-    else:
-        print(json.dumps({**payload, "steps": []}, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=False))
     return 1
 
 
-def _result_to_dict(result) -> dict:
+def _result_summary_to_dict(result) -> dict:
     return {
         "ok": result.ok,
         "code": result.code,
         "message": result.message,
-        "steps": [
-            {
-                "index": step.index,
-                "observation": _to_jsonable(step.observation),
-                "decision": _to_jsonable(step.decision),
-                "action_result": _to_jsonable(step.action_result) if step.action_result else None,
-                "verification": _to_jsonable(step.verification) if step.verification else None,
-            }
-            for step in result.steps
-        ],
+        "steps": len(result.steps),
     }
-
-
-def _to_jsonable(value):
-    if is_dataclass(value):
-        return asdict(value)
-    if isinstance(value, dict):
-        return {key: _to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_to_jsonable(item) for item in value]
-    return value
 
 
 if __name__ == "__main__":

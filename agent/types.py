@@ -76,6 +76,15 @@ class TaskStepSpec:
 
 
 @dataclass(frozen=True)
+class ActionSequenceHint:
+    order: int
+    action: str
+    raw: str
+    target_hint: str = ""
+    text: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class WindowTransition:
     source_alias: Optional[str]
     source_title: Optional[str]
@@ -120,38 +129,56 @@ class ToolResult:
 class ReasonerDecision:
     thought: str
     action: Optional[AgentAction] = None
+    actions: List[AgentAction] = field(default_factory=list)
     expected_observation: str = ""
     done: bool = False
     failure: Optional[str] = None
 
     @classmethod
     def from_dict(cls, value: Dict[str, Any]) -> "ReasonerDecision":
-        action_value = value.get("action")
+        actions: List[AgentAction] = []
+
+        raw_actions = value.get("actions")
+        if raw_actions is not None:
+            if not isinstance(raw_actions, list):
+                raise ValueError("decision.actions must be a list")
+            actions = [_agent_action_from_dict(item) for item in raw_actions]
+
         action = None
+        action_value = value.get("action")
         if action_value is not None:
-            if not isinstance(action_value, dict):
-                raise ValueError("decision.action must be an object")
-            action_type = action_value.get("type")
-            if not isinstance(action_type, str) or not action_type:
-                raise ValueError("decision.action.type is required")
-            raw_element_idx = action_value.get("element_idx")
-            element_idx = None
-            if raw_element_idx is not None:
-                element_idx = int(raw_element_idx)
-            args = action_value.get("args", {})
-            if args is None:
-                args = {}
-            if not isinstance(args, dict):
-                raise ValueError("decision.action.args must be an object")
-            action = AgentAction(type=action_type, element_idx=element_idx, args=args)
+            action = _agent_action_from_dict(action_value)
+            if not actions:
+                actions = [action]
+        elif actions:
+            action = actions[0]
 
         return cls(
             thought=str(value.get("thought", "")),
             action=action,
+            actions=actions,
             expected_observation=str(value.get("expected_observation", "")),
             done=bool(value.get("done", False)),
             failure=value.get("failure"),
         )
+
+
+def _agent_action_from_dict(value: Dict[str, Any]) -> AgentAction:
+    if not isinstance(value, dict):
+        raise ValueError("agent action must be an object")
+    action_type = value.get("type")
+    if not isinstance(action_type, str) or not action_type:
+        raise ValueError("agent action.type is required")
+    raw_element_idx = value.get("element_idx")
+    element_idx = None
+    if raw_element_idx is not None:
+        element_idx = int(raw_element_idx)
+    args = value.get("args", {})
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        raise ValueError("agent action.args must be an object")
+    return AgentAction(type=action_type, element_idx=element_idx, args=args)
 
 
 @dataclass
