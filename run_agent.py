@@ -4,6 +4,12 @@ import argparse
 import json
 from pathlib import Path
 
+from agent.failure_handler import (
+    FailureContext,
+    FailurePolicy,
+    FailureStage,
+    summarize_failure_decision,
+)
 from agent.react_agent import ReActAgent
 from agent.runtime_logger import ConsoleRunLogger, NullRunLogger
 from agent.task_loader import load_task_by_id
@@ -59,32 +65,41 @@ def _run(args) -> int:
             "reasoner": args.reasoner,
         },
     )
-    task = load_task_by_id(TASKS_DIR, args.task)
+    try:
+        task = load_task_by_id(TASKS_DIR, args.task)
+    except Exception as exc:
+        return _handle_startup_failure(logger, args, "TASK_LOAD_FAILED", str(exc))
     logger.log("加载任务文档", {"path": str(task.path), "title": task.title})
-    reasoner = _build_reasoner(args, logger)
+    try:
+        reasoner = _build_reasoner(args, logger)
+    except Exception as exc:
+        return _handle_startup_failure(logger, args, "REASONER_SETUP_FAILED", str(exc))
     logger.log("推理器已配置", {"reasoner": args.reasoner})
 
-    omni_config = OmniParserConfig.from_env()
-    service = OmniParserService(omni_config, logger=logger)
     try:
+        omni_config = OmniParserConfig.from_env()
+        service = OmniParserService(omni_config, logger=logger)
         service.ensure_running()
     except Exception as exc:
-        return _print_startup_failure(args, "OMNIPARSER_UNAVAILABLE", str(exc))
+        return _handle_startup_failure(logger, args, "OMNIPARSER_UNAVAILABLE", str(exc))
 
     try:
-        vision = create_vision_provider(logger=logger)
-        vision_verifier = VisionVerifier(vision, logger=logger)
-        desktop = MaaDesktop()
-        ui_parser = OmniParserClient(omni_config, logger=logger)
-        agent = ReActAgent(
-            task=task,
-            desktop=desktop,
-            ui_parser=ui_parser,
-            reasoner=reasoner,
-            vision_verifier=vision_verifier,
-            max_steps=args.max_steps,
-            logger=logger,
-        )
+        try:
+            vision = create_vision_provider(logger=logger)
+            vision_verifier = VisionVerifier(vision, logger=logger)
+            desktop = MaaDesktop()
+            ui_parser = OmniParserClient(omni_config, logger=logger)
+            agent = ReActAgent(
+                task=task,
+                desktop=desktop,
+                ui_parser=ui_parser,
+                reasoner=reasoner,
+                vision_verifier=vision_verifier,
+                max_steps=args.max_steps,
+                logger=logger,
+            )
+        except Exception as exc:
+            return _handle_startup_failure(logger, args, "AGENT_SETUP_FAILED", str(exc))
         result = agent.run()
     finally:
         service.shutdown_if_owned()
@@ -108,11 +123,22 @@ def _build_reasoner(args, logger=None):
     if args.reasoner == "deepseek":
         return DeepSeekReasoner.from_env(logger=logger)
     if args.script is None:
-        raise SystemExit("--script is required when --reasoner script is used")
+        raise ValueError("--script is required when --reasoner script is used")
     values = json.loads(args.script.read_text(encoding="utf-8-sig"))
     if not isinstance(values, list):
-        raise SystemExit("script must be a JSON list of decisions")
+        raise ValueError("script must be a JSON list of decisions")
     return ScriptedReasoner(ReasonerDecision.from_dict(item) for item in values)
+
+
+def _handle_startup_failure(logger, args, code: str, message: str) -> int:
+    failure = FailureContext(
+        stage=FailureStage.STARTUP,
+        code=code,
+        message=message,
+    )
+    decision = FailurePolicy().decide(failure)
+    logger.log("错误处理决策", summarize_failure_decision(failure, decision))
+    return _print_startup_failure(args, code, message)
 
 
 def _print_startup_failure(args, code: str, message: str) -> int:

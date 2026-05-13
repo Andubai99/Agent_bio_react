@@ -4,6 +4,13 @@ import re
 from dataclasses import replace
 from typing import List
 
+from agent.failure_handler import (
+    FailureContext,
+    FailureDecisionType,
+    FailurePolicy,
+    FailureStage,
+    summarize_failure_decision,
+)
 from agent.runtime_logger import (
     NullRunLogger,
     summarize_decision,
@@ -40,6 +47,7 @@ class ReActAgent:
         self.page_change_detector = page_change_detector or PageChangeDetector()
         self.max_steps = max_steps
         self.logger = logger or NullRunLogger()
+        self.failure_policy = FailurePolicy()
 
     def run(self) -> AgentRunResult:
         self.logger.log(
@@ -56,10 +64,25 @@ class ReActAgent:
         connected = self.desktop.connect_window(title_keyword)
         self.logger.log("窗口连接结果", summarize_tool_result(connected))
         if not connected.ok:
+            self._handle_failure(
+                FailureContext(
+                    stage=FailureStage.WINDOW_CONNECT,
+                    code=connected.code,
+                    message=connected.message,
+                    result=connected,
+                )
+            )
             return AgentRunResult(False, connected.code, connected.message, [])
 
         task_steps = parsed_task.steps
         if not task_steps:
+            self._handle_failure(
+                FailureContext(
+                    stage=FailureStage.STARTUP,
+                    code="NO_TASK_INSTRUCTIONS",
+                    message="Task has no executable instructions.",
+                )
+            )
             return AgentRunResult(False, "NO_TASK_INSTRUCTIONS", "Task has no executable instructions.", [])
         self.logger.log(
             "任务结构化解析结果",
@@ -79,7 +102,6 @@ class ReActAgent:
 
         steps: List[StepOutcome] = []
         current_instruction_index = 0
-        current_instruction_verification_failures = 0
         cached_observation: Observation | None = None
         reuse_cached_observation = False
         for index in range(1, self.max_steps + 1):
@@ -122,6 +144,17 @@ class ReActAgent:
             )
             self.logger.log("观察前窗口上下文检查结果", summarize_tool_result(window_ready))
             if not window_ready.ok:
+                self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.PRE_WINDOW_SYNC,
+                        code=window_ready.code,
+                        message=window_ready.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                        result=window_ready,
+                    )
+                )
                 return AgentRunResult(False, window_ready.code, window_ready.message, steps)
 
             observation_result = self._observe(
@@ -131,6 +164,21 @@ class ReActAgent:
             )
             reuse_cached_observation = False
             if isinstance(observation_result, ToolResult):
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.OBSERVE,
+                        code=observation_result.code,
+                        message=observation_result.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                        result=observation_result,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_OBSERVE:
+                    cached_observation = None
+                    reuse_cached_observation = False
+                    continue
                 return AgentRunResult(False, observation_result.code, observation_result.message, steps)
             observation = observation_result
             cached_observation = observation
@@ -146,28 +194,62 @@ class ReActAgent:
                     )
                 )
             except Exception as exc:
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.REASONER,
+                        code="REASONER_FAILED",
+                        message=str(exc),
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_REASONER:
+                    cached_observation = observation
+                    reuse_cached_observation = True
+                    continue
                 return AgentRunResult(False, "REASONER_FAILED", str(exc), steps)
             self.logger.log("推理器输出", summarize_decision(decision))
 
             if decision.done:
                 if decision.failure is not None:
+                    self._handle_failure(
+                        FailureContext(
+                            stage=FailureStage.REASONER,
+                            code=str(decision.failure),
+                            message=str(decision.failure),
+                            instruction_index=current_instruction_index + 1,
+                            loop_step=index,
+                            window_transition=window_transition,
+                        )
+                    )
                     return AgentRunResult(False, str(decision.failure), str(decision.failure), steps)
-                verification = self.vision_verifier.verify_completion(
-                    _current_instruction_verification_prompt(
-                        current_step.verification_text,
-                        current_index=current_instruction_index,
-                        total=len(task_steps),
-                    ),
-                    ImageInfo(
-                        path=observation.screenshot_path,
-                        width=observation.image_size[0],
-                        height=observation.image_size[1],
-                        resolution=observation.resolution,
+                verification_prompt = _current_instruction_verification_prompt(
+                    current_step.verification_text,
+                    current_index=current_instruction_index,
+                    total=len(task_steps),
+                )
+                verification_screenshot = ImageInfo(
+                    path=observation.screenshot_path,
+                    width=observation.image_size[0],
+                    height=observation.image_size[1],
+                    resolution=observation.resolution,
+                )
+                verification = self.vision_verifier.verify_completion(verification_prompt, verification_screenshot)
+                self.logger.log("当前任务指示验证结果", summarize_tool_result(verification))
+                verification = self._retry_verification_if_allowed(
+                    verification,
+                    stage=FailureStage.VERIFICATION,
+                    instruction_index=current_instruction_index + 1,
+                    loop_step=index,
+                    window_transition=window_transition,
+                    retry=lambda: self.vision_verifier.verify_completion(
+                        verification_prompt,
+                        verification_screenshot,
                     ),
                 )
-                self.logger.log("当前任务指示验证结果", summarize_tool_result(verification))
                 if verification.ok:
-                    current_instruction_verification_failures = 0
+                    self.failure_policy.reset_instruction(current_instruction_index + 1)
                     current_instruction_index += 1
                     completion = self._finish_if_all_instructions_verified(
                         current_instruction_index,
@@ -177,24 +259,39 @@ class ReActAgent:
                     if completion is not None:
                         return completion
                     continue
-                if verification.code == "VERIFY_FAILED":
-                    current_instruction_verification_failures += 1
-                    if current_instruction_verification_failures == 1:
-                        self.logger.log(
-                            "Vision verification failed; retrying current instruction once",
-                            {
-                                "index": current_instruction_index + 1,
-                                "total": len(task_steps),
-                                "action": current_step.action_text,
-                                "verification": current_step.verification_text,
-                                "page_changed": None,
-                            },
-                        )
-                        continue
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.VERIFICATION,
+                        code=verification.code,
+                        message=verification.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        page_changed=_verification_page_changed(verification),
+                        window_transition=window_transition,
+                        result=verification,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_INSTRUCTION:
+                    reuse_cached_observation = _verification_page_changed(verification) is False
+                    continue
                 return AgentRunResult(False, verification.code, verification.message, steps)
 
             actions = _actions_from_decision(decision)
             if not actions:
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.NO_ACTION,
+                        code="NO_ACTION",
+                        message="Reasoner did not provide any action.",
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_REASONER:
+                    cached_observation = observation
+                    reuse_cached_observation = True
+                    continue
                 return AgentRunResult(
                     False,
                     "NO_ACTION",
@@ -224,6 +321,21 @@ class ReActAgent:
             if not action_result.ok:
                 outcome = StepOutcome(index, observation, decision, action_result, None)
                 steps.append(outcome)
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.ACTION,
+                        code=action_result.code,
+                        message=action_result.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                        result=action_result,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_OBSERVE:
+                    cached_observation = None
+                    reuse_cached_observation = False
+                    continue
                 return AgentRunResult(False, action_result.code, action_result.message, steps)
 
             window_sync = self.desktop.sync_after_action(
@@ -234,14 +346,66 @@ class ReActAgent:
             if not window_sync.ok:
                 outcome = StepOutcome(index, observation, decision, window_sync, None)
                 steps.append(outcome)
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.POST_WINDOW_SYNC,
+                        code=window_sync.code,
+                        message=window_sync.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                        result=window_sync,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_INSTRUCTION:
+                    cached_observation = None
+                    reuse_cached_observation = False
+                    continue
                 return AgentRunResult(False, window_sync.code, window_sync.message, steps)
 
             try:
                 post_screenshot = self.desktop.capture(f"step_{index}_after_action")
             except Exception as exc:
-                outcome = StepOutcome(index, observation, decision, action_result, None)
-                steps.append(outcome)
-                return AgentRunResult(False, "POST_ACTION_SCREENSHOT_FAILED", str(exc), steps)
+                post_screenshot_failure = ToolResult(False, "POST_ACTION_SCREENSHOT_FAILED", str(exc))
+                failure_decision = self._handle_failure(
+                    FailureContext(
+                        stage=FailureStage.POST_SCREENSHOT,
+                        code=post_screenshot_failure.code,
+                        message=post_screenshot_failure.message,
+                        instruction_index=current_instruction_index + 1,
+                        loop_step=index,
+                        window_transition=window_transition,
+                        result=post_screenshot_failure,
+                    )
+                )
+                if failure_decision.decision == FailureDecisionType.RETRY_SCREENSHOT:
+                    try:
+                        post_screenshot = self.desktop.capture(f"step_{index}_after_action_retry")
+                    except Exception as retry_exc:
+                        post_screenshot_failure = ToolResult(False, "POST_ACTION_SCREENSHOT_FAILED", str(retry_exc))
+                        self._handle_failure(
+                            FailureContext(
+                                stage=FailureStage.POST_SCREENSHOT,
+                                code=post_screenshot_failure.code,
+                                message=post_screenshot_failure.message,
+                                instruction_index=current_instruction_index + 1,
+                                loop_step=index,
+                                window_transition=window_transition,
+                                result=post_screenshot_failure,
+                            )
+                        )
+                        outcome = StepOutcome(index, observation, decision, action_result, None)
+                        steps.append(outcome)
+                        return AgentRunResult(
+                            False,
+                            post_screenshot_failure.code,
+                            post_screenshot_failure.message,
+                            steps,
+                        )
+                else:
+                    outcome = StepOutcome(index, observation, decision, action_result, None)
+                    steps.append(outcome)
+                    return AgentRunResult(False, post_screenshot_failure.code, post_screenshot_failure.message, steps)
 
             verification_prompt = _current_instruction_verification_prompt(
                 current_step.verification_text,
@@ -266,6 +430,27 @@ class ReActAgent:
                     page_change=page_change,
                 )
             self.logger.log("当前任务指示验证结果", summarize_tool_result(verification))
+            verification = self._retry_verification_if_allowed(
+                verification,
+                stage=FailureStage.PAGE_CHANGE
+                if verification.code == "PAGE_CHANGE_COMPARISON_FAILED"
+                else FailureStage.VERIFICATION,
+                instruction_index=current_instruction_index + 1,
+                loop_step=index,
+                page_changed=_verification_page_changed(verification),
+                window_transition=window_transition,
+                retry=lambda: self._verify_after_action(
+                    verification_prompt,
+                    before_screenshot=before_screenshot,
+                    after_screenshot=post_screenshot,
+                    page_change=page_change,
+                ),
+                fallback_single=lambda: self.vision_verifier.verify_completion(
+                    verification_prompt,
+                    post_screenshot,
+                ),
+                fallback_page_change=page_change,
+            )
             outcome = StepOutcome(
                 index=index,
                 observation=observation,
@@ -277,7 +462,7 @@ class ReActAgent:
             page_changed = _verification_page_changed(verification)
             reuse_cached_observation = page_changed is False
             if verification.ok:
-                current_instruction_verification_failures = 0
+                self.failure_policy.reset_instruction(current_instruction_index + 1)
                 current_instruction_index += 1
                 completion = self._finish_if_all_instructions_verified(
                     current_instruction_index,
@@ -287,38 +472,91 @@ class ReActAgent:
                 if completion is not None:
                     return completion
                 continue
-            if verification.code == "VERIFY_FAILED":
-                current_instruction_verification_failures += 1
-                if current_instruction_verification_failures == 1:
-                    self.logger.log(
-                        "Vision verification failed; retrying current instruction once",
-                        {
-                            "index": current_instruction_index + 1,
-                            "total": len(task_steps),
-                            "action": current_step.action_text,
-                            "verification": current_step.verification_text,
-                            "page_changed": page_changed,
-                        },
-                    )
-                    continue
-                self.logger.log(
-                    "当前任务指示验证不通过，按要求中断退出",
-                    {
-                        "index": current_instruction_index + 1,
-                        "total": len(task_steps),
-                        "action": current_step.action_text,
-                        "verification": current_step.verification_text,
-                    },
+            failure_decision = self._handle_failure(
+                FailureContext(
+                    stage=FailureStage.VERIFICATION,
+                    code=verification.code,
+                    message=verification.message,
+                    instruction_index=current_instruction_index + 1,
+                    loop_step=index,
+                    page_changed=page_changed,
+                    window_transition=window_transition,
+                    result=verification,
                 )
-                return AgentRunResult(False, verification.code, verification.message, steps)
+            )
+            if failure_decision.decision == FailureDecisionType.RETRY_INSTRUCTION:
+                reuse_cached_observation = page_changed is False
+                continue
             return AgentRunResult(False, verification.code, verification.message, steps)
 
-        return AgentRunResult(
+        max_steps_failure = ToolResult(
             False,
             "MAX_STEPS_EXCEEDED",
             f"Exceeded max_steps={self.max_steps}.",
+        )
+        self._handle_failure(
+            FailureContext(
+                stage=FailureStage.MAX_STEPS,
+                code=max_steps_failure.code,
+                message=max_steps_failure.message,
+                result=max_steps_failure,
+            )
+        )
+        return AgentRunResult(
+            False,
+            max_steps_failure.code,
+            max_steps_failure.message,
             steps,
         )
+
+    def _handle_failure(self, context: FailureContext):
+        decision = self.failure_policy.decide(context)
+        self.logger.log("错误处理决策", summarize_failure_decision(context, decision))
+        return decision
+
+    def _retry_verification_if_allowed(
+        self,
+        verification: ToolResult,
+        *,
+        stage: FailureStage,
+        instruction_index: int,
+        loop_step: int,
+        window_transition,
+        retry,
+        page_changed: bool | None = None,
+        fallback_single=None,
+        fallback_page_change: PageChangeResult | None = None,
+    ) -> ToolResult:
+        current = verification
+        while not current.ok:
+            if not _same_screenshot_verification_retriable(current.code):
+                return current
+            context = FailureContext(
+                stage=stage,
+                code=current.code,
+                message=current.message,
+                instruction_index=instruction_index,
+                loop_step=loop_step,
+                page_changed=page_changed,
+                window_transition=window_transition,
+                result=current,
+            )
+            failure_decision = self._handle_failure(context)
+            if failure_decision.decision == FailureDecisionType.RETRY_VERIFICATION:
+                current = retry()
+                self.logger.log("当前任务指示验证重试结果", summarize_tool_result(current))
+                continue
+            if (
+                failure_decision.decision == FailureDecisionType.FALLBACK_SINGLE_SCREENSHOT_VERIFICATION
+                and fallback_single is not None
+            ):
+                current = fallback_single()
+                if fallback_page_change is not None:
+                    _attach_page_change_result(current, fallback_page_change)
+                self.logger.log("当前任务指示单图兜底验证结果", summarize_tool_result(current))
+                continue
+            return current
+        return current
 
     def _detect_page_change(
         self,
@@ -583,6 +821,14 @@ class ReActAgent:
         success_check = self._verify_success_criteria()
         self.logger.log("完成判据验证结果", summarize_tool_result(success_check))
         if not success_check.ok:
+            self._handle_failure(
+                FailureContext(
+                    stage=FailureStage.SUCCESS_CRITERIA,
+                    code=success_check.code,
+                    message=success_check.message,
+                    result=success_check,
+                )
+            )
             return AgentRunResult(False, success_check.code, success_check.message, steps)
         return AgentRunResult(True, "OK", "Task complete.", steps)
 
@@ -594,6 +840,13 @@ def _attach_page_change_result(verification: ToolResult, page_change: PageChange
     verification.data["page_change_reason"] = page_change.reason
     verification.data["page_change_metrics"] = page_change.metrics
     verification.data["page_change_local_decisive"] = page_change.local_decisive
+
+
+def _same_screenshot_verification_retriable(code: str) -> bool:
+    return (
+        code.startswith("VISION_")
+        and (code.endswith("_FORMAT_ERROR") or code.endswith("_FAILED"))
+    ) or code == "PAGE_CHANGE_COMPARISON_FAILED"
 
 
 def _actions_from_decision(decision) -> list:

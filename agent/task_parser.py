@@ -82,7 +82,7 @@ def _strip_markdown_fences(body: str) -> str:
 
 
 _ACTION_PATTERN = re.compile(
-    r"双击|点击|单击|输入(?!框|栏|字段)|键入|填写|勾选|选中|选择(?!框)|按下|按|等待|拖拽|拖动",
+    r"双击|点击|单击|输入(?!框|栏|字段)|键入|填写|勾选|选中|选择(?!框)|按下|等待|拖拽|拖动",
     re.IGNORECASE,
 )
 
@@ -95,7 +95,7 @@ def _normalize_action_verb(value: str) -> str:
         return "input_text"
     if text in {"拖拽", "拖动"}:
         return "drag"
-    if text in {"按下", "按"}:
+    if text in {"按下"}:
         return "press_key"
     if text in {"等待"}:
         return "wait"
@@ -135,7 +135,7 @@ def _text_value_from_segment(segment: str, action: str) -> str | None:
 
 
 def _strip_leading_action_verb(text: str) -> str:
-    return re.sub(r"^\s*(?:请|需要|将)?\s*(?:双击|点击|单击|输入|键入|填写|勾选|选中|选择|按下|按|等待|拖拽|拖动)\s*", "", text)
+    return re.sub(r"^\s*(?:请|需要|将)?\s*(?:双击|点击|单击|输入|键入|填写|勾选|选中|选择|按下|等待|拖拽|拖动)\s*", "", text)
 
 
 def _clean_action_target(value: str) -> str:
@@ -144,6 +144,7 @@ def _clean_action_target(value: str) -> str:
     text = re.sub(r"^(?:在|向)\s*", "", text)
     text = re.sub(r"(?:，|,)?\s*(?:然后|再|并)\s*$", "", text)
     text = re.sub(r"\s*(?:中|内|里|处)$", "", text)
+    text = re.sub(r"\s*(?:按钮|按键)$", "", text)
     text = text.strip(" 。；;，,")
     for char in ("`", "“", "”", '"', "'"):
         text = text.replace(char, "")
