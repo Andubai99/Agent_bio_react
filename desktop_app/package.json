@@ -1,0 +1,27 @@
+{
+  "name": "agent-bio-react-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "npm run start:desktop",
+    "build": "tsc --noEmit && vite build",
+    "preview:renderer": "vite preview",
+    "start": "npm run start:desktop",
+    "start:desktop": "npm run build && node scripts/start-electron.cjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^6.0.1",
+    "electron": "^39.2.7",
+    "typescript": "^5.6.3",
+    "vite": "^8.0.12"
+  }
+}
