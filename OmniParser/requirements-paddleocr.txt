@@ -1,0 +1,5 @@
+--index-url https://www.paddlepaddle.org.cn/packages/stable/cu130/
+--extra-index-url https://pypi.org/simple
+
+paddlepaddle-gpu==3.3.1
+paddleocr==2.10.0

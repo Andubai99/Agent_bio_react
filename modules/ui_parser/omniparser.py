@@ -19,7 +19,8 @@ from agent.runtime_logger import NullRunLogger
 from agent.types import ImageInfo, UIElement
 
 
-DEFAULT_ROOT = Path(r"F:\OmniParser")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_ROOT = PROJECT_ROOT / "OmniParser"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8001
 DEFAULT_TIMEOUT_SECONDS = 300.0
@@ -43,7 +44,7 @@ class OmniParserConfig:
     @classmethod
     def from_env(cls) -> "OmniParserConfig":
         return cls(
-            root=Path(os.environ.get("OMNIPARSER_ROOT", str(DEFAULT_ROOT))),
+            root=_omniparser_root_from_env(),
             host=os.environ.get("OMNIPARSER_HOST", DEFAULT_HOST).strip() or DEFAULT_HOST,
             port=int(os.environ.get("OMNIPARSER_PORT", str(DEFAULT_PORT))),
             timeout_seconds=float(os.environ.get("OMNIPARSER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))),
@@ -67,6 +68,16 @@ class SyntheticTargetSpec:
     kind: str
     label: str
     side: str
+
+
+def _omniparser_root_from_env() -> Path:
+    value = os.environ.get("OMNIPARSER_ROOT", "").strip()
+    if not value:
+        return DEFAULT_ROOT
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
 
 
 class OmniParserService:

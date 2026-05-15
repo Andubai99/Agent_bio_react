@@ -9,9 +9,9 @@
 ## Key Changes
 
 - OmniParser 服务管理：
-  - 新增服务管理层，启动前先请求 `GET /probe/`；若不可用，用 `F:\OmniParser\.venv\Scripts\python.exe` 启动 `F:\OmniParser\omnitool\omniparserserver\omniparserserver.py`。
-  - 默认启动参数：`--som_model_path F:\OmniParser\weights\icon_detect\model.pt`、`--caption_model_name florence2`、`--caption_model_path F:\OmniParser\weights\icon_caption_florence`、`--device cuda`、`--BOX_TRESHOLD 0.05`、`--host 127.0.0.1`、`--port 8001`。
-  - Agent 只用 `/probe/` 判定服务可用；`F:\OmniParser\imgs\ScreenShot_2026-05-06_192141_030.png` 作为手动/开发验证图片，不纳入每次运行自检。
+  - 新增服务管理层，启动前先请求 `GET /probe/`；若不可用，用 `OmniParser/.venv/Scripts/python.exe` 启动 `OmniParser/omnitool/omniparserserver/omniparserserver.py`。
+  - 默认启动参数：`--som_model_path OmniParser/weights/icon_detect/model.pt`、`--caption_model_name florence2`、`--caption_model_path OmniParser/weights/icon_caption_florence`、`--device cuda`、`--BOX_TRESHOLD 0.05`、`--host 127.0.0.1`、`--port 8001`。
+  - Agent 只用 `/probe/` 判定服务可用；`OmniParser/imgs/ScreenShot_2026-05-06_192141_030.png` 作为手动/开发验证图片，不纳入每次运行自检。
 - Agent 循环：
   - `connect_window` 只在启动时执行一次，并激活置前。
   - 每轮先截图，再调用 OmniParser `/parse/` 得到元素列表。
@@ -49,7 +49,7 @@
   - 无服务时运行 Agent，确认会自动启动 OmniParser 并通过 `/probe/`。
   - 已有服务时运行 Agent，确认复用服务且结束时不关闭外部服务。
   - 本次启动的服务在 Agent 结束后被关闭。
-  - 用 `F:\OmniParser\imgs\ScreenShot_2026-05-06_192141_030.png` 手动调用解析客户端，确认能返回 `parsed_content_list`。
+  - 用 `OmniParser/imgs/ScreenShot_2026-05-06_192141_030.png` 手动调用解析客户端，确认能返回 `parsed_content_list`。
   - Scripted reasoner 使用 `element_idx` 能执行 click/input_text。
   - DeepSeek reasoner 不输出坐标，只输出动作类型和元素序号。
   - 动作后视觉验证失败时，运行结果返回失败，不写 memory。

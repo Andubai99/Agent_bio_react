@@ -101,6 +101,14 @@ traces.jsonl
 desktop_app/node_modules/
 desktop_app/dist/
 
+# Embedded OmniParser local/runtime artifacts
+OmniParser/.venv/
+OmniParser/weights/
+OmniParser/results/
+OmniParser/imgs/
+OmniParser/.cache/
+OmniParser/**/.cache/
+
 # Auto-coder skill cache
 .github/skills/auto-coder/.spec_hash
 
