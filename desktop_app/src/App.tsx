@@ -3,11 +3,8 @@ import {
   Check,
   ChevronDown,
   Eye,
-  FileText,
   KeyRound,
-  LayoutDashboard,
   ListChecks,
-  Monitor,
   Play,
   RotateCcw,
   Settings,
@@ -16,21 +13,32 @@ import {
   Terminal,
   Zap
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  defaultReasonerConfig,
-  defaultVisionConfig,
-  initialTasks,
-  runtimeEvents
-} from "./data";
-import type { ProviderConfig, TaskItem, TaskStatus } from "./types";
+  createLogsSocket,
+  getRunEvents,
+  getHealth,
+  getRunStatus,
+  getTasks,
+  startRun,
+  stopRun
+} from "./api/client";
+import { defaultReasonerConfig, defaultVisionConfig } from "./data";
+import type {
+  BackendState,
+  LogEvent,
+  ProviderConfig,
+  RunStatus,
+  ServerTask,
+  TaskItem,
+  TaskStatus
+} from "./types";
 
-type TabId = "tasks" | "monitor" | "settings" | "logs";
+type TabId = "tasks" | "settings" | "logs";
 type ConfigKind = "reasoner" | "vision";
 
 const tabs: Array<{ id: TabId; label: string; icon: typeof ListChecks }> = [
   { id: "tasks", label: "任务", icon: ListChecks },
-  { id: "monitor", label: "运行监控", icon: Monitor },
   { id: "settings", label: "设置", icon: Settings },
   { id: "logs", label: "日志", icon: Terminal }
 ];
@@ -71,26 +79,212 @@ const visionPresets = [
   }
 ];
 
+const idleStatus: RunStatus = {
+  state: "idle",
+  run_id: null,
+  log_path: null,
+  task: null,
+  reasoner: null,
+  pid: null,
+  started_at: null,
+  ended_at: null,
+  exit_code: null,
+  last_summary: null
+};
+
 export function App() {
   const [activeTab, setActiveTab] = useState<TabId>("tasks");
-  const [tasks, setTasks] = useState<TaskItem[]>(initialTasks);
+  const [backendState, setBackendState] = useState<BackendState>("checking");
+  const [backendMessage, setBackendMessage] = useState("正在连接本地后端");
+  const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [runStatus, setRunStatus] = useState<RunStatus>(idleStatus);
+  const [logs, setLogs] = useState<LogEvent[]>([]);
+  const [operationError, setOperationError] = useState<string | null>(null);
   const [reasoner, setReasoner] = useState<ProviderConfig>(defaultReasonerConfig);
   const [vision, setVision] = useState<ProviderConfig>(defaultVisionConfig);
+  const socketRef = useRef<WebSocket | null>(null);
+  const activeLogRunIdRef = useRef<string | null>(null);
 
-  const activeTask = useMemo(() => tasks.find((task) => task.selected) ?? tasks[0], [tasks]);
+  useEffect(() => {
+    void refreshBackend();
+    const interval = window.setInterval(() => {
+      void refreshStatus();
+    }, 1000);
+    const logInterval = window.setInterval(() => {
+      void syncLogEvents();
+    }, 1000);
+    return () => {
+      window.clearInterval(interval);
+      window.clearInterval(logInterval);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (backendState !== "connected") {
+      socketRef.current?.close();
+      socketRef.current = null;
+      return;
+    }
+    socketRef.current?.close();
+    socketRef.current = createLogsSocket(
+      (event) => {
+        appendLogEvent(event);
+        if (event.type === "status" && event.state) {
+          setRunStatus((status) => ({
+            ...status,
+            run_id: event.run_id ?? status.run_id,
+            state: event.state ?? status.state,
+            exit_code: event.exit_code ?? status.exit_code
+          }));
+        }
+        if (event.type === "summary" && event.summary) {
+          setRunStatus((status) => ({ ...status, last_summary: event.summary ?? status.last_summary }));
+        }
+      },
+      () => setBackendMessage("日志连接已断开，状态轮询仍在继续"),
+      () => setBackendMessage("日志连接异常，状态轮询仍在继续")
+    );
+    return () => {
+      socketRef.current?.close();
+      socketRef.current = null;
+    };
+  }, [backendState]);
+
+  const activeTask = useMemo(
+    () => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0] ?? emptyTask(),
+    [selectedTaskId, tasks]
+  );
+  const currentInstructionIndex = useMemo(() => latestInstructionIndex(logs, runStatus), [logs, runStatus]);
+  const decoratedTasks = useMemo(
+    () => tasks.map((task) => decorateTask({ ...task, selected: task.id === selectedTaskId }, runStatus, currentInstructionIndex)),
+    [currentInstructionIndex, runStatus, selectedTaskId, tasks]
+  );
+  const decoratedActiveTask = useMemo(
+    () => decorateTask({ ...activeTask, selected: true }, runStatus, currentInstructionIndex),
+    [activeTask, currentInstructionIndex, runStatus]
+  );
+  const isRunning = runStatus.state === "running";
+  const backendConnected = backendState === "connected";
+
+  async function refreshBackend() {
+    try {
+      setBackendState("checking");
+      const ok = await getHealth();
+      if (!ok) {
+        throw new Error("Health check failed.");
+      }
+      setBackendState("connected");
+      setBackendMessage("本地后端已连接");
+      setOperationError(null);
+      await Promise.all([loadTasks(), refreshStatus()]);
+    } catch (error) {
+      setBackendState("disconnected");
+      setBackendMessage("本地后端未连接，请先启动 agent_server");
+      setOperationError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function loadTasks() {
+    const serverTasks = await getTasks();
+    const nextTasks = serverTasks.map(mapServerTask);
+    setTasks(nextTasks);
+    setSelectedTaskId((current) => current ?? nextTasks[0]?.id ?? null);
+  }
+
+  async function refreshStatus() {
+    try {
+      const status = await getRunStatus();
+      setRunStatus(status);
+      setBackendState("connected");
+      setBackendMessage("本地后端已连接");
+      setOperationError(null);
+    } catch {
+      setBackendState("disconnected");
+      setBackendMessage("本地后端未连接，请先启动 agent_server");
+    }
+  }
+
+  async function syncLogEvents() {
+    try {
+      const events = await getRunEvents();
+      events.forEach(handleLogEvent);
+    } catch {
+      return;
+    }
+  }
+
+  function handleLogEvent(event: LogEvent) {
+    appendLogEvent(event);
+    if (event.type === "status" && event.state) {
+      setRunStatus((status) => ({
+        ...status,
+        run_id: event.run_id ?? status.run_id,
+        state: event.state ?? status.state,
+        exit_code: event.exit_code ?? status.exit_code
+      }));
+    }
+    if (event.type === "summary" && event.summary) {
+      setRunStatus((status) => ({ ...status, last_summary: event.summary ?? status.last_summary }));
+    }
+  }
+
+  function appendLogEvent(event: LogEvent) {
+    const eventRunId = event.run_id ?? null;
+    const shouldReset = Boolean(eventRunId && activeLogRunIdRef.current !== eventRunId);
+    if (shouldReset) {
+      activeLogRunIdRef.current = eventRunId;
+    }
+    setLogs((items) => {
+      const base = shouldReset ? [] : items;
+      const eventKey = logEventKey(event);
+      if (base.some((item) => logEventKey(item) === eventKey)) {
+        return base;
+      }
+      return [...base, event].slice(-1000);
+    });
+  }
+
+  async function handleStartRun() {
+    if (!backendConnected || !activeTask.id || isRunning) {
+      return;
+    }
+    setOperationError(null);
+    if (reasoner.preset !== "deepseek") {
+      setOperationError("当前最小闭环只支持使用 DeepSeek 启动 Agent，其他模型配置暂未接入后端。");
+      return;
+    }
+    activeLogRunIdRef.current = null;
+    setLogs([]);
+    try {
+      const status = await startRun({
+        task: activeTask.id,
+        reasoner: "deepseek",
+        max_steps: 30
+      });
+      setRunStatus(status);
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleStopRun() {
+    if (!backendConnected || !isRunning) {
+      return;
+    }
+    setOperationError(null);
+    try {
+      const status = await stopRun();
+      if (status) {
+        setRunStatus(status);
+      }
+    } catch (error) {
+      setOperationError(error instanceof Error ? error.message : String(error));
+    }
+  }
 
   function toggleTask(taskId: string) {
-    setTasks((items) =>
-      items.map((task) =>
-        task.id === taskId
-          ? {
-              ...task,
-              selected: !task.selected,
-              status: !task.selected ? "ready" : "idle"
-            }
-          : task
-      )
-    );
+    setSelectedTaskId(taskId);
   }
 
   function updateProvider(kind: ConfigKind, next: ProviderConfig) {
@@ -130,44 +324,86 @@ export function App() {
       </header>
 
       <main className="content">
+        <BackendBanner
+          backendMessage={backendMessage}
+          backendState={backendState}
+          operationError={operationError}
+          refreshBackend={refreshBackend}
+        />
         {activeTab === "tasks" && (
           <TaskWorkspace
-            activeTask={activeTask}
+            activeTask={decoratedActiveTask}
+            backendConnected={backendConnected}
+            isRunning={isRunning}
             reasoner={reasoner}
-            tasks={tasks}
+            refreshTasks={loadTasks}
+            runStatus={runStatus}
+            startRun={handleStartRun}
+            stopRun={handleStopRun}
+            tasks={decoratedTasks}
             toggleTask={toggleTask}
             vision={vision}
           />
         )}
-        {activeTab === "monitor" && <MonitorView activeTask={activeTask} />}
         {activeTab === "settings" && (
-          <SettingsView
-            reasoner={reasoner}
-            updateProvider={updateProvider}
-            vision={vision}
-          />
+          <SettingsView reasoner={reasoner} updateProvider={updateProvider} vision={vision} />
         )}
-        {activeTab === "logs" && <LogsView />}
+        {activeTab === "logs" && <LogsView logs={logs} runStatus={runStatus} />}
       </main>
+    </div>
+  );
+}
+
+function BackendBanner({
+  backendMessage,
+  backendState,
+  operationError,
+  refreshBackend
+}: {
+  backendMessage: string;
+  backendState: BackendState;
+  operationError: string | null;
+  refreshBackend: () => Promise<void>;
+}) {
+  return (
+    <div className={`backend-banner ${backendState}`}>
+      <span>{backendMessage}</span>
+      {operationError && <strong>{operationError}</strong>}
+      <button onClick={() => void refreshBackend()} type="button">
+        重新连接
+      </button>
     </div>
   );
 }
 
 function TaskWorkspace({
   activeTask,
+  backendConnected,
+  isRunning,
   reasoner,
+  refreshTasks,
+  runStatus,
+  startRun,
+  stopRun,
   tasks,
   toggleTask,
   vision
 }: {
   activeTask: TaskItem;
+  backendConnected: boolean;
+  isRunning: boolean;
   reasoner: ProviderConfig;
+  refreshTasks: () => Promise<void>;
+  runStatus: RunStatus;
+  startRun: () => Promise<void>;
+  stopRun: () => Promise<void>;
   tasks: TaskItem[];
   toggleTask: (taskId: string) => void;
   vision: ProviderConfig;
 }) {
   const selectedCount = tasks.filter((task) => task.selected).length;
-  const currentStep = activeTask.steps.find((step) => step.status === "running") ?? activeTask.steps[0];
+  const currentStep = activeTask.steps.find((step) => step.status === "running");
+  const completedCount = activeTask.steps.filter((step) => step.status === "passed").length;
 
   return (
     <section className="workspace-grid">
@@ -177,19 +413,16 @@ function TaskWorkspace({
             <h2>任务列表</h2>
             <span>{selectedCount} 项已勾选</span>
           </div>
-          <button className="icon-button" type="button" aria-label="刷新任务">
+          <button className="icon-button" onClick={() => void refreshTasks()} type="button" aria-label="刷新任务">
             <RotateCcw size={17} />
           </button>
         </div>
 
         <div className="task-list">
+          {tasks.length === 0 && <div className="empty-state">未加载到任务</div>}
           {tasks.map((task) => (
             <label className={task.selected ? "task-row selected" : "task-row"} key={task.id}>
-              <input
-                checked={task.selected}
-                onChange={() => toggleTask(task.id)}
-                type="checkbox"
-              />
+              <input checked={task.selected} onChange={() => toggleTask(task.id)} type="checkbox" />
               <span className="task-copy">
                 <strong>{task.name}</strong>
                 <small>{task.description}</small>
@@ -200,54 +433,65 @@ function TaskWorkspace({
         </div>
 
         <div className="task-actions">
-          <button className="secondary-button" type="button">
+          <button className="secondary-button" disabled={!backendConnected || !isRunning} onClick={() => void stopRun()} type="button">
             <Square size={15} />
             停止
           </button>
-          <button className="primary-button" type="button">
+          <button className="primary-button" disabled={!backendConnected || isRunning || !activeTask.id} onClick={() => void startRun()} type="button">
             <Play size={15} />
             开始运行
           </button>
         </div>
       </aside>
 
-      <section className="live-panel">
+      <section className="run-panel">
         <div className="panel-heading">
           <div>
-            <h2>当前任务窗口</h2>
-            <span>{currentStep?.window ?? "未选择窗口"}</span>
+            <h2>{activeTask.name || "未选择任务"}</h2>
+            <span>{runStateLabel(runStatus.state)} · {completedCount}/{activeTask.steps.length || 0} 步</span>
           </div>
-          <div className="runtime-pills">
-            <span>
-              <Zap size={14} />
-              {reasoner.model}
-            </span>
-            <span>
-              <Eye size={14} />
-              {vision.model}
-            </span>
+          <StatusBadge status={activeTask.status} />
+        </div>
+
+        <div className="run-overview">
+          <div className="model-strip" aria-label="当前任务窗口">
+            <ModelPill icon={<Zap size={17} />} label="推理层模型" value={runStatus.reasoner ?? reasoner.model} />
+            <ModelPill icon={<Eye size={17} />} label="视觉模型" value={vision.model} />
+          </div>
+
+          <div className="run-metrics">
+            <div>
+              <span>当前步骤</span>
+              <strong>{currentStep ? `${currentStep.number}. ${currentStep.action}` : activeTask.steps.length ? "等待运行" : "无任务步骤"}</strong>
+            </div>
+            <div>
+              <span>运行日志</span>
+              <strong>{runStatus.log_path ?? "-"}</strong>
+            </div>
+            <div>
+              <span>PID</span>
+              <strong>{runStatus.pid ?? "-"}</strong>
+            </div>
           </div>
         </div>
 
-        <div className="live-layout">
-          <WindowPreview activeTask={activeTask} />
-          <div className="step-panel">
-            <div className="section-title">
-              <Activity size={16} />
-              执行进度
-            </div>
-            <div className="step-list">
-              {activeTask.steps.map((step) => (
-                <div className={step.status === "running" ? "step-row running" : "step-row"} key={step.number}>
-                  <span className="step-number">{step.number}</span>
-                  <span className="step-main">
-                    <strong>{step.action}</strong>
-                    <small>{step.verification}</small>
-                  </span>
-                  <StatusBadge status={step.status} />
-                </div>
-              ))}
-            </div>
+        <div className="step-panel">
+          <div className="section-title">
+            <Activity size={16} />
+            执行进度
+          </div>
+          <div className="step-list">
+            {activeTask.steps.length === 0 && <div className="empty-state">该任务暂无结构化步骤</div>}
+            {activeTask.steps.map((step) => (
+              <div className={`step-row ${step.status}`} key={step.number}>
+                <span className="step-number">{step.number}</span>
+                <span className="step-main">
+                  <strong>{step.action}</strong>
+                  <small>{step.window} · {step.verification}</small>
+                </span>
+                <StatusBadge status={step.status} />
+              </div>
+            ))}
           </div>
         </div>
       </section>
@@ -255,88 +499,15 @@ function TaskWorkspace({
   );
 }
 
-function WindowPreview({ activeTask }: { activeTask: TaskItem }) {
+function ModelPill({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
-    <div className="window-preview">
-      <div className="mock-window-bar">
-        <span>Thermo BioPharma Finder 5.1</span>
-        <div className="window-controls">
-          <i />
-          <i />
-          <i />
-        </div>
-      </div>
-      <div className="mock-ribbon">
-        <button className="ribbon-active" type="button">Home</button>
-        <button type="button">Intact Mass Analysis</button>
-        <button type="button">Load Results</button>
-        <button type="button">Queue</button>
-      </div>
-      <div className="mock-body">
-        <div className="form-column">
-          <label>
-            Experiment Name
-            <input readOnly value="BioPharma test demo1" />
-          </label>
-          <label>
-            Analysis File
-            <div className="file-field">1#_20230714133351.raw</div>
-          </label>
-          <label className="checkbox-line">
-            <input checked readOnly type="checkbox" />
-            Default ReSpect
-          </label>
-          <button className="queue-button" type="button">Add To Queue</button>
-        </div>
-        <div className="queue-column">
-          <div className="queue-header">Run Queue</div>
-          <div className="queue-item active">
-            <FileText size={15} />
-            {activeTask.name}
-          </div>
-          <div className="queue-table">
-            <span>状态</span>
-            <strong>配置中</strong>
-            <span>窗口</span>
-            <strong>主窗口</strong>
-            <span>验证</span>
-            <strong>Qwen running</strong>
-          </div>
-        </div>
-      </div>
+    <div className="model-pill">
+      <span className="model-icon">{icon}</span>
+      <span className="model-copy">
+        <small>{label}</small>
+        <strong>{value}</strong>
+      </span>
     </div>
-  );
-}
-
-function MonitorView({ activeTask }: { activeTask: TaskItem }) {
-  return (
-    <section className="monitor-grid">
-      <div className="wide-panel">
-        <div className="panel-heading">
-          <div>
-            <h2>运行监控</h2>
-            <span>{activeTask.name}</span>
-          </div>
-          <StatusBadge status={activeTask.status} />
-        </div>
-        <div className="event-list">
-          {runtimeEvents.map(([time, type, message]) => (
-            <div className="event-row" key={`${time}-${message}`}>
-              <span>{time}</span>
-              <strong>{type}</strong>
-              <p>{message}</p>
-            </div>
-          ))}
-        </div>
-      </div>
-      <div className="side-panel">
-        <div className="section-title">
-          <Monitor size={16} />
-          当前窗口
-        </div>
-        <WindowPreview activeTask={activeTask} />
-      </div>
-    </section>
   );
 }
 
@@ -425,18 +596,10 @@ function ModelSection({
           {title}
         </div>
         <div className="segmented">
-          <button
-            className={config.mode === "preset" ? "active" : ""}
-            onClick={() => patch({ mode: "preset" })}
-            type="button"
-          >
+          <button className={config.mode === "preset" ? "active" : ""} onClick={() => patch({ mode: "preset" })} type="button">
             内置
           </button>
-          <button
-            className={config.mode === "custom" ? "active" : ""}
-            onClick={() => patch({ mode: "custom" })}
-            type="button"
-          >
+          <button className={config.mode === "custom" ? "active" : ""} onClick={() => patch({ mode: "custom" })} type="button">
             自定义
           </button>
         </div>
@@ -446,11 +609,7 @@ function ModelSection({
         <label>
           模型来源
           <div className="select-wrap">
-            <select
-              disabled={config.mode === "custom"}
-              onChange={(event) => setPreset(event.target.value)}
-              value={config.preset}
-            >
+            <select disabled={config.mode === "custom"} onChange={(event) => setPreset(event.target.value)} value={config.preset}>
               {presets.map((preset) => (
                 <option key={preset.id} value={preset.id}>
                   {preset.label}
@@ -463,20 +622,12 @@ function ModelSection({
 
         <label>
           Model
-          <input
-            onChange={(event) => patch({ model: event.target.value })}
-            readOnly={config.mode === "preset"}
-            value={config.model}
-          />
+          <input onChange={(event) => patch({ model: event.target.value })} readOnly={config.mode === "preset"} value={config.model} />
         </label>
 
         <label className="form-wide">
           Endpoint
-          <input
-            onChange={(event) => patch({ endpoint: event.target.value })}
-            readOnly={config.mode === "preset"}
-            value={config.endpoint}
-          />
+          <input onChange={(event) => patch({ endpoint: event.target.value })} readOnly={config.mode === "preset"} value={config.endpoint} />
         </label>
 
         <label className="form-wide">
@@ -494,22 +645,12 @@ function ModelSection({
 
         <label>
           Timeout
-          <input
-            min={1}
-            onChange={(event) => patch({ timeoutSeconds: Number(event.target.value) })}
-            type="number"
-            value={config.timeoutSeconds}
-          />
+          <input min={1} onChange={(event) => patch({ timeoutSeconds: Number(event.target.value) })} type="number" value={config.timeoutSeconds} />
         </label>
 
         <label>
           Max Tokens
-          <input
-            min={1}
-            onChange={(event) => patch({ maxTokens: Number(event.target.value) })}
-            type="number"
-            value={config.maxTokens}
-          />
+          <input min={1} onChange={(event) => patch({ maxTokens: Number(event.target.value) })} type="number" value={config.maxTokens} />
         </label>
       </div>
 
@@ -527,21 +668,32 @@ function ModelSection({
   );
 }
 
-function LogsView() {
+function LogsView({ logs, runStatus }: { logs: LogEvent[]; runStatus: RunStatus }) {
+  const logEndRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ block: "end" });
+  }, [logs.length]);
+
   return (
     <section className="wide-panel">
       <div className="panel-heading">
         <div>
           <h2>日志</h2>
-          <span>logs/错误逻辑处理层工作日志.md</span>
+          <span>
+            当前状态：{runStateLabel(runStatus.state)}
+            {runStatus.log_path ? ` · ${runStatus.log_path}` : ""}
+          </span>
         </div>
       </div>
       <div className="log-console">
-        <p>[15:03:40] startup failure routed through FailurePolicy</p>
-        <p>-----------</p>
-        <p>[15:04:16] verification provider: qwen3-vl-flash</p>
-        <p>-----------</p>
-        <p>[15:04:18] current instruction retry budget: 1</p>
+        {logs.length === 0 && <p>等待运行日志...</p>}
+        {logs.map((event) => (
+          <p className={event.stream === "stderr" ? "log-error" : ""} key={logEventKey(event)}>
+            {formatLogEvent(event)}
+          </p>
+        ))}
+        <div ref={logEndRef} />
       </div>
     </section>
   );
@@ -561,4 +713,147 @@ function StatusBadge({ status }: { status: TaskStatus }) {
   };
 
   return <span className={`status-badge ${status}`}>{label[status]}</span>;
+}
+
+function mapServerTask(task: ServerTask): TaskItem {
+  return {
+    id: task.id,
+    name: task.title,
+    description: task.description || task.path,
+    selected: false,
+    status: "idle",
+    steps: task.steps.map((step) => ({
+      number: step.number,
+      action: step.action,
+      window: step.window,
+      verification: step.verification,
+      status: "idle"
+    }))
+  };
+}
+
+function decorateTask(task: TaskItem, status: RunStatus, currentInstructionIndex: number | null): TaskItem {
+  const selected = status.task === task.id || task.selected;
+  if (status.task !== task.id) {
+    return { ...task, selected, status: selected ? "ready" : "idle" };
+  }
+  const activeIndex = clampStepIndex(currentInstructionIndex ?? 0, task.steps.length);
+  if (status.state === "running") {
+    return {
+      ...task,
+      selected: true,
+      status: "running",
+      steps: task.steps.map((step, index) => ({
+        ...step,
+        status: index < activeIndex ? "passed" : index === activeIndex ? "running" : "idle"
+      }))
+    };
+  }
+  if (status.state === "succeeded") {
+    return {
+      ...task,
+      selected: true,
+      status: "passed",
+      steps: task.steps.map((step) => ({ ...step, status: "passed" }))
+    };
+  }
+  if (status.state === "failed") {
+    return {
+      ...task,
+      selected: true,
+      status: "failed",
+      steps: task.steps.map((step, index) => ({
+        ...step,
+        status: index < activeIndex ? "passed" : index === activeIndex ? "failed" : "idle"
+      }))
+    };
+  }
+  return { ...task, selected: true, status: "ready" };
+}
+
+function latestInstructionIndex(logs: LogEvent[], status: RunStatus) {
+  if (!status.run_id) {
+    return null;
+  }
+  for (let index = logs.length - 1; index >= 0; index -= 1) {
+    const event = logs[index];
+    if (event.run_id && event.run_id !== status.run_id) {
+      continue;
+    }
+    if (event.type !== "log" || !event.line) {
+      continue;
+    }
+    const match = event.line.match(/^\s*index:\s*(\d+)\s*$/);
+    if (!match) {
+      continue;
+    }
+    const value = Number(match[1]);
+    if (Number.isFinite(value) && value > 0) {
+      return value - 1;
+    }
+  }
+  return null;
+}
+
+function clampStepIndex(index: number, length: number) {
+  if (length <= 0) {
+    return 0;
+  }
+  return Math.min(Math.max(index, 0), length - 1);
+}
+
+function emptyTask(): TaskItem {
+  return {
+    id: "",
+    name: "未加载任务",
+    description: "请连接本地后端",
+    selected: false,
+    status: "idle",
+    steps: []
+  };
+}
+
+function runStateLabel(state: RunStatus["state"]) {
+  const label: Record<RunStatus["state"], string> = {
+    idle: "空闲",
+    running: "运行中",
+    succeeded: "成功",
+    failed: "失败",
+    stopped: "已停止"
+  };
+  return label[state];
+}
+
+function formatTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "--:--:--";
+  }
+  return date.toLocaleTimeString("zh-CN", { hour12: false });
+}
+
+function logEventKey(event: LogEvent) {
+  return `${event.run_id ?? "run"}:${event.seq}:${event.type}`;
+}
+
+function formatLogEvent(event: LogEvent) {
+  if (event.type === "log") {
+    return `[${formatTime(event.timestamp)}] ${event.stream ?? "log"}  ${event.line ?? ""}`;
+  }
+  if (event.type === "summary") {
+    return `[${formatTime(event.timestamp)}] summary  ${formatSummary(event.summary)}`;
+  }
+  return `[${formatTime(event.timestamp)}] status  ${event.state}${event.exit_code === undefined ? "" : ` exit=${event.exit_code}`}`;
+}
+
+function formatSummary(summary: Record<string, unknown> | undefined) {
+  if (!summary) {
+    return "";
+  }
+  const code = typeof summary.code === "string" ? summary.code : "";
+  const ok = typeof summary.ok === "boolean" ? String(summary.ok) : "";
+  const steps = typeof summary.steps === "number" ? String(summary.steps) : "";
+  const message = typeof summary.message === "string" ? summary.message : "";
+  const shortenedMessage = message.length > 240 ? `${message.slice(0, 240)}...` : message;
+  return JSON.stringify({ ok, code, message: shortenedMessage, steps });
 }
