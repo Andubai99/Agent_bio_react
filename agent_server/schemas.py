@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 RunState = Literal["idle", "running", "succeeded", "failed", "stopped"]
 ReasonerName = Literal["manual", "script", "deepseek"]
+OmniParserState = Literal["unknown", "starting", "running", "stopping", "stopped", "failed"]
 
 
 class TaskStepInfo(BaseModel):
@@ -48,3 +49,22 @@ class ApiMessage(BaseModel):
     code: str
     message: str
     status: RunStatus | None = None
+
+
+class OmniParserStatus(BaseModel):
+    state: OmniParserState
+    probe_ok: bool
+    owned: bool
+    pid: int | None = None
+    host: str
+    port: int
+    root: str
+    last_probe_at: str | None = None
+    message: str = ""
+
+
+class OmniParserActionResponse(BaseModel):
+    ok: bool
+    code: str
+    message: str
+    status: OmniParserStatus

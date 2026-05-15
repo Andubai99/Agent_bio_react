@@ -32,6 +32,7 @@ export type ProviderConfig = {
 export type BackendState = "checking" | "connected" | "disconnected";
 
 export type RunState = "idle" | "running" | "succeeded" | "failed" | "stopped";
+export type OmniParserState = "unknown" | "starting" | "running" | "stopping" | "stopped" | "failed";
 
 export type RunStatus = {
   state: RunState;
@@ -69,4 +70,23 @@ export type LogEvent = {
   state?: RunState;
   exit_code?: number;
   summary?: Record<string, unknown>;
+};
+
+export type OmniParserStatus = {
+  state: OmniParserState;
+  probe_ok: boolean;
+  owned: boolean;
+  pid: number | null;
+  host: string;
+  port: number;
+  root: string;
+  last_probe_at: string | null;
+  message: string;
+};
+
+export type OmniParserActionResponse = {
+  ok: boolean;
+  code: string;
+  message: string;
+  status: OmniParserStatus;
 };

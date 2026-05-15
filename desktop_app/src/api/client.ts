@@ -1,4 +1,4 @@
-import type { LogEvent, RunStatus, ServerTask } from "../types";
+import type { LogEvent, OmniParserActionResponse, OmniParserStatus, RunStatus, ServerTask } from "../types";
 
 export const API_BASE = "http://127.0.0.1:8765";
 export const LOGS_WS_URL = "ws://127.0.0.1:8765/runs/logs";
@@ -63,6 +63,34 @@ export async function stopRun(): Promise<RunStatus | null> {
   }
   const payload = await response.json();
   return payload.status ?? null;
+}
+
+export async function getOmniParserStatus(): Promise<OmniParserStatus> {
+  const response = await fetch(`${API_BASE}/omniparser/status`);
+  if (!response.ok) {
+    throw new Error(`Load OmniParser status failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function startOmniParser(): Promise<OmniParserActionResponse> {
+  const response = await fetch(`${API_BASE}/omniparser/start`, {method: "POST"});
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = payload?.detail?.message ?? payload?.message ?? `Start OmniParser failed: ${response.status}`;
+    throw new Error(detail);
+  }
+  return payload;
+}
+
+export async function stopOmniParser(): Promise<OmniParserActionResponse> {
+  const response = await fetch(`${API_BASE}/omniparser/stop`, {method: "POST"});
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    const detail = payload?.detail?.message ?? payload?.message ?? `Stop OmniParser failed: ${response.status}`;
+    throw new Error(detail);
+  }
+  return payload;
 }
 
 export function createLogsSocket(onEvent: (event: LogEvent) => void, onClose: () => void, onError: () => void): WebSocket {

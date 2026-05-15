@@ -16,17 +16,21 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   createLogsSocket,
+  getOmniParserStatus,
   getRunEvents,
   getHealth,
   getRunStatus,
   getTasks,
+  startOmniParser,
   startRun,
+  stopOmniParser,
   stopRun
 } from "./api/client";
 import { defaultReasonerConfig, defaultVisionConfig } from "./data";
 import type {
   BackendState,
   LogEvent,
+  OmniParserStatus,
   ProviderConfig,
   RunStatus,
   ServerTask,
@@ -92,6 +96,18 @@ const idleStatus: RunStatus = {
   last_summary: null
 };
 
+const idleOmniParserStatus: OmniParserStatus = {
+  state: "unknown",
+  probe_ok: false,
+  owned: false,
+  pid: null,
+  host: "127.0.0.1",
+  port: 8001,
+  root: "",
+  last_probe_at: null,
+  message: "等待连接本地后端"
+};
+
 export function App() {
   const [activeTab, setActiveTab] = useState<TabId>("tasks");
   const [backendState, setBackendState] = useState<BackendState>("checking");
@@ -103,6 +119,9 @@ export function App() {
   const [operationError, setOperationError] = useState<string | null>(null);
   const [reasoner, setReasoner] = useState<ProviderConfig>(defaultReasonerConfig);
   const [vision, setVision] = useState<ProviderConfig>(defaultVisionConfig);
+  const [omniParserStatus, setOmniParserStatus] = useState<OmniParserStatus>(idleOmniParserStatus);
+  const [omniParserBusy, setOmniParserBusy] = useState(false);
+  const [omniParserError, setOmniParserError] = useState<string | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const activeLogRunIdRef = useRef<string | null>(null);
 
@@ -114,9 +133,13 @@ export function App() {
     const logInterval = window.setInterval(() => {
       void syncLogEvents();
     }, 1000);
+    const omniParserInterval = window.setInterval(() => {
+      void refreshOmniParserStatus();
+    }, 2000);
     return () => {
       window.clearInterval(interval);
       window.clearInterval(logInterval);
+      window.clearInterval(omniParserInterval);
     };
   }, []);
 
@@ -177,11 +200,72 @@ export function App() {
       setBackendState("connected");
       setBackendMessage("本地后端已连接");
       setOperationError(null);
-      await Promise.all([loadTasks(), refreshStatus()]);
+      await Promise.all([loadTasks(), refreshStatus(), refreshOmniParserStatus()]);
     } catch (error) {
       setBackendState("disconnected");
       setBackendMessage("本地后端未连接，请先启动 agent_server");
       setOperationError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function refreshOmniParserStatus() {
+    if (backendState === "disconnected") {
+      return;
+    }
+    try {
+      const status = await getOmniParserStatus();
+      setOmniParserStatus(status);
+      setOmniParserError(null);
+    } catch (error) {
+      setOmniParserStatus((status) => ({
+        ...status,
+        state: "unknown",
+        probe_ok: false,
+        message: "无法读取 OmniParser 状态"
+      }));
+      setOmniParserError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleStartOmniParser() {
+    if (!backendConnected || omniParserBusy) {
+      return;
+    }
+    setOmniParserBusy(true);
+    setOmniParserError(null);
+    setOmniParserStatus((status) => ({ ...status, state: "starting", message: "正在启动 OmniParser" }));
+    try {
+      const response = await startOmniParser();
+      setOmniParserStatus(response.status);
+      if (!response.ok) {
+        setOmniParserError(response.message);
+      }
+    } catch (error) {
+      setOmniParserError(error instanceof Error ? error.message : String(error));
+      await refreshOmniParserStatus();
+    } finally {
+      setOmniParserBusy(false);
+    }
+  }
+
+  async function handleStopOmniParser() {
+    if (!backendConnected || omniParserBusy || isRunning) {
+      return;
+    }
+    setOmniParserBusy(true);
+    setOmniParserError(null);
+    setOmniParserStatus((status) => ({ ...status, state: "stopping", message: "正在停止 OmniParser" }));
+    try {
+      const response = await stopOmniParser();
+      setOmniParserStatus(response.status);
+      if (!response.ok) {
+        setOmniParserError(response.message);
+      }
+    } catch (error) {
+      setOmniParserError(error instanceof Error ? error.message : String(error));
+      await refreshOmniParserStatus();
+    } finally {
+      setOmniParserBusy(false);
     }
   }
 
@@ -346,7 +430,19 @@ export function App() {
           />
         )}
         {activeTab === "settings" && (
-          <SettingsView reasoner={reasoner} updateProvider={updateProvider} vision={vision} />
+          <SettingsView
+            backendConnected={backendConnected}
+            isRunning={isRunning}
+            omniParserBusy={omniParserBusy}
+            omniParserError={omniParserError}
+            omniParserStatus={omniParserStatus}
+            reasoner={reasoner}
+            refreshOmniParserStatus={refreshOmniParserStatus}
+            startOmniParser={handleStartOmniParser}
+            stopOmniParser={handleStopOmniParser}
+            updateProvider={updateProvider}
+            vision={vision}
+          />
         )}
         {activeTab === "logs" && <LogsView logs={logs} runStatus={runStatus} />}
       </main>
@@ -512,11 +608,27 @@ function ModelPill({ icon, label, value }: { icon: React.ReactNode; label: strin
 }
 
 function SettingsView({
+  backendConnected,
+  isRunning,
+  omniParserBusy,
+  omniParserError,
+  omniParserStatus,
   reasoner,
+  refreshOmniParserStatus,
+  startOmniParser,
+  stopOmniParser,
   updateProvider,
   vision
 }: {
+  backendConnected: boolean;
+  isRunning: boolean;
+  omniParserBusy: boolean;
+  omniParserError: string | null;
+  omniParserStatus: OmniParserStatus;
   reasoner: ProviderConfig;
+  refreshOmniParserStatus: () => Promise<void>;
+  startOmniParser: () => Promise<void>;
+  stopOmniParser: () => Promise<void>;
   updateProvider: (kind: ConfigKind, next: ProviderConfig) => void;
   vision: ProviderConfig;
 }) {
@@ -539,6 +651,16 @@ function SettingsView({
       </aside>
 
       <div className="settings-content">
+        <OmniParserSection
+          backendConnected={backendConnected}
+          isRunning={isRunning}
+          omniParserBusy={omniParserBusy}
+          omniParserError={omniParserError}
+          refreshStatus={refreshOmniParserStatus}
+          startService={startOmniParser}
+          status={omniParserStatus}
+          stopService={stopOmniParser}
+        />
         <ModelSection
           config={reasoner}
           icon={<Zap size={17} />}
@@ -555,6 +677,92 @@ function SettingsView({
           title="视觉模型"
           updateProvider={updateProvider}
         />
+      </div>
+    </section>
+  );
+}
+
+function OmniParserSection({
+  backendConnected,
+  isRunning,
+  omniParserBusy,
+  omniParserError,
+  refreshStatus,
+  startService,
+  status,
+  stopService
+}: {
+  backendConnected: boolean;
+  isRunning: boolean;
+  omniParserBusy: boolean;
+  omniParserError: string | null;
+  refreshStatus: () => Promise<void>;
+  startService: () => Promise<void>;
+  status: OmniParserStatus;
+  stopService: () => Promise<void>;
+}) {
+  const running = status.state === "running" && status.probe_ok;
+  const statusText = omniParserStateLabel(status.state);
+  const address = `${status.host}:${status.port}`;
+
+  return (
+    <section className="settings-section omniparser-section">
+      <div className="section-heading">
+        <div className="section-title">
+          <Activity size={17} />
+          OmniParser 服务
+        </div>
+        <span className={`service-state ${status.state}`}>{statusText}</span>
+      </div>
+
+      <div className="service-overview">
+        <div>
+          <span>服务地址</span>
+          <strong>{address}</strong>
+        </div>
+        <div>
+          <span>PID</span>
+          <strong>{status.pid ?? "-"}</strong>
+        </div>
+        <div>
+          <span>启动来源</span>
+          <strong>{status.owned ? "本项目启动" : running ? "外部服务" : "-"}</strong>
+        </div>
+        <div>
+          <span>最近探活</span>
+          <strong>{status.last_probe_at ? formatDateTime(status.last_probe_at) : "-"}</strong>
+        </div>
+      </div>
+
+      <div className="service-path">
+        <span>根目录</span>
+        <strong>{status.root || "OmniParser/"}</strong>
+      </div>
+
+      <div className="service-message">
+        <span>{status.message}</span>
+        {omniParserError && <strong>{omniParserError}</strong>}
+      </div>
+
+      <div className="section-actions">
+        <button className="secondary-button" disabled={!backendConnected || omniParserBusy} onClick={() => void refreshStatus()} type="button">
+          <RotateCcw size={15} />
+          刷新状态
+        </button>
+        <button className="secondary-button" disabled={!backendConnected || omniParserBusy || running} onClick={() => void startService()} type="button">
+          <Play size={15} />
+          启动
+        </button>
+        <button
+          className="danger-button"
+          disabled={!backendConnected || omniParserBusy || isRunning || !running || !status.owned}
+          onClick={() => void stopService()}
+          type="button"
+          title={!status.owned && running ? "只能停止由本项目启动的 OmniParser" : undefined}
+        >
+          <Square size={15} />
+          停止
+        </button>
       </div>
     </section>
   );
@@ -822,6 +1030,26 @@ function runStateLabel(state: RunStatus["state"]) {
     stopped: "已停止"
   };
   return label[state];
+}
+
+function omniParserStateLabel(state: OmniParserStatus["state"]) {
+  const label: Record<OmniParserStatus["state"], string> = {
+    unknown: "未知",
+    starting: "启动中",
+    running: "运行中",
+    stopping: "停止中",
+    stopped: "未启动",
+    failed: "失败"
+  };
+  return label[state];
+}
+
+function formatDateTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString("zh-CN", { hour12: false });
 }
 
 function formatTime(value: string) {

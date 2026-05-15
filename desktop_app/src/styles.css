@@ -289,7 +289,8 @@ button:disabled {
 }
 
 .primary-button,
-.secondary-button {
+.secondary-button,
+.danger-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -309,6 +310,12 @@ button:disabled {
   border: 1px solid #d8dde4;
   background: #ffffff;
   color: #2f3843;
+}
+
+.danger-button {
+  border: 1px solid #efb8b8;
+  background: #fff6f6;
+  color: #bf3434;
 }
 
 .run-panel,
@@ -561,6 +568,75 @@ button:disabled {
   padding: 16px;
 }
 
+.omniparser-section {
+  display: grid;
+  gap: 14px;
+}
+
+.service-state {
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  border-radius: 6px;
+  padding: 0 10px;
+  background: #eef3f8;
+  color: #3d4651;
+  font-size: 12px;
+  font-weight: 620;
+}
+
+.service-state.running {
+  background: #e8f7ef;
+  color: #117a4f;
+}
+
+.service-state.starting,
+.service-state.stopping {
+  background: #fff7e8;
+  color: #966313;
+}
+
+.service-state.failed {
+  background: #fdecec;
+  color: #bf3434;
+}
+
+.service-overview {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.service-overview div,
+.service-path,
+.service-message {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  border: 1px solid #e1e6ed;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+
+.service-overview span,
+.service-path span,
+.service-message span {
+  color: #69727d;
+  font-size: 12px;
+}
+
+.service-overview strong,
+.service-path strong,
+.service-message strong {
+  overflow: hidden;
+  color: #222831;
+  font-size: 13px;
+  font-weight: 620;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .segmented {
   display: inline-grid;
   grid-template-columns: repeat(2, 92px);
@@ -672,7 +748,8 @@ button:disabled {
   }
 
   .model-strip,
-  .run-metrics {
+  .run-metrics,
+  .service-overview {
     grid-template-columns: 1fr;
   }
 }
