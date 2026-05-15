@@ -1,0 +1,26 @@
+# Agent_bio_react Desktop App
+
+`desktop_app/` 是本项目的桌面软件前端目录，独立于 Python Agent 主逻辑。当前版本是 Electron + Vite + React + TypeScript 原型，启动后打开独立软件窗口，不需要浏览器。
+
+## Commands
+
+```powershell
+npm install
+npm run start:desktop
+npm run build
+```
+
+The desktop app expects the local Python server to be running:
+
+```powershell
+cd F:\Agent_bio_react
+python -m agent_server
+```
+
+## Scope
+
+- 任务首页：左侧任务列表从 `agent_server` 读取，勾选后进入待运行任务集合。
+- 实时窗口：右侧展示当前任务窗口与执行步骤状态。
+- 模型设置：支持切换推理模型、视觉模型，以及自定义 API Key、Endpoint、Model 等配置。
+
+当前 `desktop_app/src/api/` 已封装任务列表、运行状态、启动/停止和日志 WebSocket 接口。后续可继续扩展截图流和模型配置读写。
