@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from agent.task_loader import load_task
+from agent.task_loader import iter_task_paths, load_task
 from agent.task_parser import parse_task_body
 from agent_server.schemas import RunStatus, StartRunRequest, TaskInfo, TaskStepInfo
 
@@ -42,7 +42,7 @@ class RunManager:
 
     def list_tasks(self) -> list[TaskInfo]:
         tasks: list[TaskInfo] = []
-        for path in sorted(self.tasks_dir.glob("*.md")):
+        for path in iter_task_paths(self.tasks_dir):
             task = load_task(path)
             parsed_task = parse_task_body(task.body)
             tasks.append(

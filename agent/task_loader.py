@@ -24,6 +24,9 @@ class TaskSpecError(ValueError):
     pass
 
 
+TASK_DOCUMENT_NAME = "task.md"
+
+
 def load_task(path: Path) -> TaskSpec:
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---\n") and not text.startswith("---\r\n"):
@@ -48,7 +51,7 @@ def load_task(path: Path) -> TaskSpec:
 def _load_plain_task(path: Path, text: str) -> TaskSpec:
     body = text.strip()
     title = _plain_title(body, path.stem)
-    task_id = path.stem
+    task_id = _plain_task_id(path)
     return TaskSpec(
         id=task_id,
         title=title,
@@ -66,9 +69,13 @@ def _load_plain_task(path: Path, text: str) -> TaskSpec:
     )
 
 
+def iter_task_paths(tasks_dir: Path) -> list[Path]:
+    paths = [*tasks_dir.glob("*.md"), *tasks_dir.glob(f"*/{TASK_DOCUMENT_NAME}")]
+    return sorted(set(paths), key=lambda item: item.as_posix())
+
+
 def load_task_by_id(tasks_dir: Path, task_id: str) -> TaskSpec:
-    candidates = sorted(tasks_dir.glob("*.md"))
-    for path in candidates:
+    for path in iter_task_paths(tasks_dir):
         task = load_task(path)
         if task.id == task_id:
             return task
@@ -98,6 +105,12 @@ def _plain_title(body: str, fallback: str) -> str:
         if stripped:
             return stripped
     return fallback
+
+
+def _plain_task_id(path: Path) -> str:
+    if path.name.lower() == TASK_DOCUMENT_NAME and path.parent.name:
+        return path.parent.name
+    return path.stem
 
 
 def _validate_frontmatter(frontmatter: Dict[str, Any], path: Path) -> None:
