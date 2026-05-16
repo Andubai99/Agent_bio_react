@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
-from typing import List
+from typing import Any, List
 
 from agent.failure_handler import (
     FailureContext,
@@ -24,6 +24,7 @@ from modules.ui_parser.omniparser import OmniParserClient
 from modules.vision.page_change_detector import PageChangeDetector, PageChangeResult
 from modules.vision.verifier import VisionVerifier
 from tools.maa_desktop import MaaDesktop
+from tools.observation_cache import ObservationCache, ObservationCacheContext
 
 
 class ReActAgent:
@@ -36,6 +37,7 @@ class ReActAgent:
         reasoner: Reasoner,
         vision_verifier: VisionVerifier,
         page_change_detector: PageChangeDetector | None = None,
+        observation_cache: ObservationCache | None = None,
         max_steps: int = 30,
         logger=None,
     ):
@@ -45,6 +47,7 @@ class ReActAgent:
         self.reasoner = reasoner
         self.vision_verifier = vision_verifier
         self.page_change_detector = page_change_detector or PageChangeDetector()
+        self.observation_cache = observation_cache if observation_cache is not None else ObservationCache.for_task(task)
         self.max_steps = max_steps
         self.logger = logger or NullRunLogger()
         self.failure_policy = FailurePolicy()
@@ -159,6 +162,7 @@ class ReActAgent:
 
             observation_result = self._observe(
                 index,
+                step_number=current_step.number,
                 current_instruction=_ui_parser_context(current_step.action_text, current_step.verification_text),
                 reuse_observation=cached_observation if reuse_cached_observation else None,
             )
@@ -746,14 +750,29 @@ class ReActAgent:
         self,
         index: int,
         *,
+        step_number: int | None = None,
         current_instruction: str = "",
         reuse_observation: Observation | None = None,
     ) -> Observation | ToolResult:
         try:
             reused = reuse_observation is not None
+            observation_source = "cached observation" if reused else "OmniParser"
+            cache_state: dict[str, Any] = {"enabled": self.observation_cache is not None}
             if reuse_observation is None:
                 screenshot = self.desktop.capture(f"step_{index}_screenshot")
-                elements = self.ui_parser.parse(screenshot, task_instruction=current_instruction)
+                cache_context = self._observation_cache_context(
+                    step_number=step_number if step_number is not None else index,
+                    screenshot=screenshot,
+                    current_instruction=current_instruction,
+                )
+                cached = self._try_observation_cache(cache_context, screenshot, current_instruction=current_instruction)
+                if cached is not None:
+                    elements, cache_state = cached
+                    reused = True
+                    observation_source = "observation cache"
+                else:
+                    elements = self.ui_parser.parse(screenshot, task_instruction=current_instruction)
+                    cache_state = self._write_observation_cache(cache_context, screenshot, elements)
             else:
                 if not reuse_observation.screenshot_path:
                     return ToolResult(False, "OBSERVE_REUSE_FAILED", "Cached observation has no screenshot path.")
@@ -771,10 +790,9 @@ class ReActAgent:
         except Exception as exc:
             return ToolResult(False, "OBSERVE_FAILED", str(exc))
         interactive_count = sum(1 for element in elements if element.interactive)
-        source = "cached observation" if reused else "OmniParser"
         return Observation(
             summary=(
-                f"Screenshot parsed by {source}: {len(elements)} elements, "
+                f"Screenshot parsed by {observation_source}: {len(elements)} elements, "
                 f"{interactive_count} interactive."
             ),
             screenshot_path=screenshot.path,
@@ -786,8 +804,131 @@ class ReActAgent:
                 "element_count": len(elements),
                 "interactive_element_count": interactive_count,
                 "reused_observation": reused,
+                "observation_source": observation_source,
+                "observation_cache": cache_state,
             },
         )
+
+    def _observation_cache_context(
+        self,
+        *,
+        step_number: int,
+        screenshot: ImageInfo,
+        current_instruction: str,
+    ) -> ObservationCacheContext:
+        return ObservationCacheContext(
+            task_id=self.task.id,
+            step_number=step_number,
+            window_title=str(self.desktop.window_title or ""),
+            instruction=current_instruction,
+            resolution=screenshot.resolution,
+            parser_params=_parser_cache_params(self.ui_parser),
+        )
+
+    def _try_observation_cache(
+        self,
+        context: ObservationCacheContext,
+        screenshot: ImageInfo,
+        *,
+        current_instruction: str,
+    ) -> tuple[list, dict[str, Any]] | None:
+        if self.observation_cache is None:
+            return None
+        try:
+            lookup = self.observation_cache.lookup(context)
+        except Exception as exc:
+            state = {"enabled": True, "hit": False, "reason": "lookup_failed", "error": str(exc)}
+            self.logger.log("观察缓存读取失败", state)
+            return None
+        if not lookup.hit or lookup.record is None:
+            state = {"enabled": True, "hit": False, "reason": lookup.reason}
+            self.logger.log("观察缓存未命中", state)
+            return None
+
+        record = lookup.record
+        cached_resolution = _resolution_from_cache_entry(record.entry)
+        cached_screenshot = ImageInfo(
+            path=str(record.screenshot_path),
+            width=cached_resolution[0],
+            height=cached_resolution[1],
+            resolution=cached_resolution,
+        )
+        page_change = self.page_change_detector.compare(cached_screenshot, screenshot)
+        self.logger.log(
+            "观察缓存差异校验结果",
+            {
+                "key": record.key,
+                "lookup_reason": lookup.reason,
+                "exact_resolution": record.exact_resolution,
+                "page_change": page_change.to_dict(),
+            },
+        )
+        if page_change.page_changed is not False or not page_change.local_decisive:
+            reason = "screenshot_changed" if page_change.page_changed is True else "screenshot_change_uncertain"
+            state = {
+                "enabled": True,
+                "hit": False,
+                "key": record.key,
+                "reason": reason,
+                "page_change": page_change.to_dict(),
+            }
+            self.logger.log("观察缓存失效", state)
+            return None
+
+        try:
+            elements = self.observation_cache.load_elements(record, current_resolution=screenshot.resolution)
+            if not elements:
+                state = {"enabled": True, "hit": False, "key": record.key, "reason": "empty_elements"}
+                self.logger.log("观察缓存失效", state)
+                return None
+            elements = self.ui_parser.postprocess_existing(
+                screenshot,
+                elements,
+                task_instruction=current_instruction,
+            )
+        except Exception as exc:
+            state = {"enabled": True, "hit": False, "key": record.key, "reason": "load_failed", "error": str(exc)}
+            self.logger.log("观察缓存读取失败", state)
+            return None
+
+        state = {
+            "enabled": True,
+            "hit": True,
+            "key": record.key,
+            "reason": lookup.reason,
+            "screenshot": str(record.screenshot_path),
+            "elements": str(record.elements_path),
+            "element_count": len(elements),
+            "exact_resolution": record.exact_resolution,
+        }
+        self.logger.log("观察缓存命中", state)
+        return elements, state
+
+    def _write_observation_cache(
+        self,
+        context: ObservationCacheContext,
+        screenshot: ImageInfo,
+        elements: list,
+    ) -> dict[str, Any]:
+        if self.observation_cache is None:
+            return {"enabled": False}
+        try:
+            record = self.observation_cache.write(context, screenshot=screenshot, elements=elements)
+        except Exception as exc:
+            state = {"enabled": True, "hit": False, "write_ok": False, "reason": "write_failed", "error": str(exc)}
+            self.logger.log("观察缓存写入失败", state)
+            return state
+        state = {
+            "enabled": True,
+            "hit": False,
+            "write_ok": True,
+            "key": record.key,
+            "screenshot": str(record.screenshot_path),
+            "elements": str(record.elements_path),
+            "element_count": len(elements),
+        }
+        self.logger.log("观察缓存写入完成", state)
+        return state
 
     def _verify_success_criteria(self) -> ToolResult:
         try:
@@ -840,6 +981,25 @@ def _attach_page_change_result(verification: ToolResult, page_change: PageChange
     verification.data["page_change_reason"] = page_change.reason
     verification.data["page_change_metrics"] = page_change.metrics
     verification.data["page_change_local_decisive"] = page_change.local_decisive
+
+
+def _parser_cache_params(ui_parser) -> dict[str, Any]:
+    config = getattr(ui_parser, "config", None)
+    if config is None:
+        return {}
+    return {
+        "box_threshold": getattr(config, "box_threshold", None),
+        "iou_threshold": getattr(config, "iou_threshold", None),
+        "use_paddleocr": getattr(config, "use_paddleocr", None),
+        "imgsz": getattr(config, "imgsz", None),
+    }
+
+
+def _resolution_from_cache_entry(entry: dict[str, Any]) -> tuple[int, int]:
+    value = entry.get("resolution")
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return 0, 0
+    return int(value[0]), int(value[1])
 
 
 def _same_screenshot_verification_retriable(code: str) -> bool:
