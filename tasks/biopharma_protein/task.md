@@ -7,9 +7,9 @@
 
 任务流程：
 
-0. 动作：点击 `Home` 。
+0. 动作：点击 `Home`。
    窗口：主窗口
-   验证：回到 `Home` 界面。
+   验证：处于 `Home` 界面。
 1. 动作：点击 `Intact Mass Analysis`。
    窗口：主窗口
    验证：页面进入 `Intact Mass Analysis` 的实验配置界面。

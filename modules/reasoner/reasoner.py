@@ -25,7 +25,7 @@ DEEPSEEK_V4_PRO_MODEL = "deepseek-v4-pro"
 DEFAULT_THINKING = "disabled"
 DEFAULT_REASONING_EFFORT = "low"
 DEFAULT_TIMEOUT_SECONDS = 60.0
-DEFAULT_MAX_TOKENS = 512
+DEFAULT_MAX_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -121,10 +121,8 @@ class DeepSeekReasoner:
             model=os.environ.get("DEEPSEEK_REASONER_MODEL", DEEPSEEK_V4_PRO_MODEL).strip()
             or DEEPSEEK_V4_PRO_MODEL,
             timeout_seconds=float(os.environ.get("DEEPSEEK_REASONER_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS))),
-            thinking=os.environ.get("DEEPSEEK_REASONER_THINKING", DEFAULT_THINKING).strip()
-            or DEFAULT_THINKING,
-            reasoning_effort=os.environ.get("DEEPSEEK_REASONER_EFFORT", DEFAULT_REASONING_EFFORT).strip()
-            or DEFAULT_REASONING_EFFORT,
+            thinking=DEFAULT_THINKING,
+            reasoning_effort=DEFAULT_REASONING_EFFORT,
             max_tokens=int(os.environ.get("DEEPSEEK_REASONER_MAX_TOKENS", str(DEFAULT_MAX_TOKENS))),
             logger=logger,
         )
@@ -230,7 +228,7 @@ def _system_prompt() -> str:
         "不要使用其他信息，不要解释，不要输出 Markdown。"
         "严格只返回一个 JSON 对象，并且只能包含 actions 这一个顶层字段："
         '{"actions":[{"action":"表示下一步动作","index":序号,"coordinate":[x,y],"text":文本或null}]}。'
-        "禁止返回旧格式 {\"action\":...}；即使只有一个动作，也必须放在 actions 数组里。"
+        "即使只有一个动作，也必须放在 actions 数组里。"
         "actions 可以包含任意数量的动作对象，必须按 task 原文语序和 action_sequence_hint 的 order 排列，执行器会按数组顺序逐个执行。"
         "如果 action_sequence_hint 不为空，通常 actions 的数量和顺序应与它一致。"
         "action_sequence_hint 是 Agent 根据任务语句解析出的参考动作序列；每个 hint 的 target_hint 用来帮助你在 omniparser_json 中选择对应元素。"
@@ -246,7 +244,6 @@ def _system_prompt() -> str:
         "input_text=向目标元素输入文本；"
         "drag=拖拽目标元素；"
         "press_key=按下键盘按键；"
-        "wait=等待；"
         "noop=不执行任何界面动作。"
         "每个对象的 index 必须来自 omniparser_json[].idx。"
         "每个对象的 coordinate 必须逐字复制同一个元素的 center 字段。"

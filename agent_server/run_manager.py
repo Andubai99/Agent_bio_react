@@ -98,6 +98,9 @@ class RunManager:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUNBUFFERED"] = "1"
+            env["DEEPSEEK_REASONER_THINKING"] = "disabled"
+            env["DEEPSEEK_REASONER_EFFORT"] = "low"
+            env["DEEPSEEK_REASONER_MAX_TOKENS"] = "1024"
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
             try:
                 process = subprocess.Popen(

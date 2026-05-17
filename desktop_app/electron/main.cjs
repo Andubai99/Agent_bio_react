@@ -1,19 +1,18 @@
-const { app, BrowserWindow, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, shell } = require("electron");
 const path = require("path");
 
 function createMainWindow() {
   const mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
-    minWidth: 1080,
-    minHeight: 700,
     title: "Agent_bio_react",
     autoHideMenuBar: true,
     backgroundColor: "#f7f8fa",
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      preload: path.join(__dirname, "preload.cjs")
     }
   });
 
@@ -24,6 +23,20 @@ function createMainWindow() {
 
   mainWindow.loadFile(path.join(__dirname, "..", "dist", "index.html"));
 }
+
+ipcMain.handle("window:get-always-on-top", (event) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  return window?.isAlwaysOnTop() ?? false;
+});
+
+ipcMain.handle("window:set-always-on-top", (event, enabled) => {
+  const window = BrowserWindow.fromWebContents(event.sender);
+  if (!window) {
+    return false;
+  }
+  window.setAlwaysOnTop(Boolean(enabled));
+  return window.isAlwaysOnTop();
+});
 
 app.whenReady().then(() => {
   createMainWindow();

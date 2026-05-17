@@ -18,13 +18,14 @@ from agent.runtime_logger import (
     summarize_tool_result,
 )
 from agent.task_parser import parse_action_sequence, parse_task_body, parse_window_transition
-from agent.types import AgentRunResult, ImageInfo, Observation, StepOutcome, TaskSpec, ToolResult
+from agent.types import AgentAction, AgentRunResult, ImageInfo, Observation, ReasonerDecision, StepOutcome, TaskSpec, ToolResult
 from modules.reasoner import Reasoner, ReasonerContext
 from modules.ui_parser.omniparser import OmniParserClient
 from modules.vision.page_change_detector import PageChangeDetector, PageChangeResult
 from modules.vision.verifier import VisionVerifier
 from tools.maa_desktop import MaaDesktop
 from tools.observation_cache import ObservationCache, ObservationCacheContext
+from tools.page_memory import PageMemory
 
 
 class ReActAgent:
@@ -48,6 +49,7 @@ class ReActAgent:
         self.vision_verifier = vision_verifier
         self.page_change_detector = page_change_detector or PageChangeDetector()
         self.observation_cache = observation_cache if observation_cache is not None else ObservationCache.for_task(task)
+        self.page_memory = PageMemory.for_task(task)
         self.max_steps = max_steps
         self.logger = logger or NullRunLogger()
         self.failure_policy = FailurePolicy()
@@ -119,6 +121,7 @@ class ReActAgent:
             current_step = task_steps[current_instruction_index]
             window_transition = parse_window_transition(current_step.window_text, parsed_task.window_definitions)
             action_sequence_hint = parse_action_sequence(current_step.action_text)
+            instruction_context = _ui_parser_context(current_step.action_text, current_step.verification_text)
             current_task = _task_with_current_instruction(
                 self.task,
                 current_instruction=current_step.action_text,
@@ -163,7 +166,7 @@ class ReActAgent:
             observation_result = self._observe(
                 index,
                 step_number=current_step.number,
-                current_instruction=_ui_parser_context(current_step.action_text, current_step.verification_text),
+                current_instruction=instruction_context,
                 reuse_observation=cached_observation if reuse_cached_observation else None,
             )
             reuse_cached_observation = False
@@ -188,32 +191,58 @@ class ReActAgent:
             cached_observation = observation
             self.logger.log("观察结果", summarize_observation(observation))
 
-            self.logger.log("调用推理器生成下一步动作")
-            try:
-                decision = self.reasoner.decide(
-                    ReasonerContext(
-                        task=current_task,
-                        observation=observation,
-                        history=steps,
+            page_state = self._verify_page_state_from_observation(current_step, observation)
+            if page_state is not None:
+                self.logger.log("页面记忆匹配结果", summarize_tool_result(page_state))
+                if page_state.ok:
+                    decision = ReasonerDecision(
+                        thought="Page memory already matches the target state; skip idempotent navigation action.",
+                        done=True,
                     )
-                )
-            except Exception as exc:
-                failure_decision = self._handle_failure(
-                    FailureContext(
-                        stage=FailureStage.REASONER,
-                        code="REASONER_FAILED",
-                        message=str(exc),
-                        instruction_index=current_instruction_index + 1,
-                        loop_step=index,
-                        window_transition=window_transition,
+                    action_result = ToolResult(
+                        True,
+                        "ACTION_SKIPPED_PAGE_ALREADY_MATCHED",
+                        "Current page already matches task page memory.",
+                        data=page_state.data,
                     )
-                )
-                if failure_decision.decision == FailureDecisionType.RETRY_REASONER:
-                    cached_observation = observation
-                    reuse_cached_observation = True
+                    steps.append(StepOutcome(index, observation, decision, action_result, page_state))
+                    self.failure_policy.reset_instruction(current_instruction_index + 1)
+                    current_instruction_index += 1
+                    cached_observation = None
+                    reuse_cached_observation = False
                     continue
-                return AgentRunResult(False, "REASONER_FAILED", str(exc), steps)
-            self.logger.log("推理器输出", summarize_decision(decision))
+
+            local_decision = _local_decision_from_action_hints(action_sequence_hint, observation)
+            if local_decision is not None:
+                decision = local_decision
+                self.logger.log("本地目标解析输出", summarize_decision(decision))
+            else:
+                self.logger.log("调用推理器生成下一步动作")
+                try:
+                    decision = self.reasoner.decide(
+                        ReasonerContext(
+                            task=current_task,
+                            observation=observation,
+                            history=steps,
+                        )
+                    )
+                except Exception as exc:
+                    failure_decision = self._handle_failure(
+                        FailureContext(
+                            stage=FailureStage.REASONER,
+                            code="REASONER_FAILED",
+                            message=str(exc),
+                            instruction_index=current_instruction_index + 1,
+                            loop_step=index,
+                            window_transition=window_transition,
+                        )
+                    )
+                    if failure_decision.decision == FailureDecisionType.RETRY_REASONER:
+                        cached_observation = observation
+                        reuse_cached_observation = True
+                        continue
+                    return AgentRunResult(False, "REASONER_FAILED", str(exc), steps)
+            self.logger.log("动作决策输出", summarize_decision(decision))
 
             if decision.done:
                 if decision.failure is not None:
@@ -312,7 +341,7 @@ class ReActAgent:
             actions = self._redirect_actions_to_synthetic_targets_if_needed(
                 actions,
                 observation=observation,
-                task_instruction=_ui_parser_context(current_step.action_text, current_step.verification_text),
+                task_instruction=instruction_context,
             )
             decision = replace(decision, action=actions[0], actions=actions)
             self.logger.log("准备执行动作序列", actions)
@@ -455,6 +484,17 @@ class ReActAgent:
                 ),
                 fallback_page_change=page_change,
             )
+            page_state_after_action = self._verify_page_state_from_screenshot_if_needed(
+                current_step,
+                verification,
+                index=index,
+                step_number=current_step.number,
+                current_instruction=instruction_context,
+                screenshot=post_screenshot,
+            )
+            if page_state_after_action is not None:
+                self.logger.log("页面记忆兜底验证结果", summarize_tool_result(page_state_after_action))
+                verification = page_state_after_action
             outcome = StepOutcome(
                 index=index,
                 observation=observation,
@@ -561,6 +601,62 @@ class ReActAgent:
                 continue
             return current
         return current
+
+    def _verify_page_state_from_observation(
+        self,
+        current_step,
+        observation: Observation,
+    ) -> ToolResult | None:
+        page_id = _page_state_target_id(current_step)
+        if page_id is None:
+            return None
+        match = self.page_memory.match(page_id, observation)
+        data = {
+            **match.to_dict(),
+            "verified": match.matched,
+            "page_changed": False,
+            "page_change_required": False,
+            "screenshot_path": observation.screenshot_path,
+        }
+        if match.matched:
+            return ToolResult(
+                True,
+                "PAGE_STATE_VERIFIED",
+                f"Current page matches memory page {page_id!r}.",
+                data=data,
+            )
+        return ToolResult(
+            False,
+            "PAGE_STATE_NOT_MATCHED",
+            f"Current page does not match memory page {page_id!r}: {match.reason}.",
+            data=data,
+        )
+
+    def _verify_page_state_from_screenshot_if_needed(
+        self,
+        current_step,
+        verification: ToolResult,
+        *,
+        index: int,
+        step_number: int,
+        current_instruction: str,
+        screenshot: ImageInfo,
+    ) -> ToolResult | None:
+        if verification.ok or _page_state_target_id(current_step) is None:
+            return None
+        observation = self._observation_from_screenshot(
+            index,
+            step_number=step_number,
+            current_instruction=current_instruction,
+            screenshot=screenshot,
+        )
+        if isinstance(observation, ToolResult):
+            return None
+        page_state = self._verify_page_state_from_observation(current_step, observation)
+        if page_state is None or not page_state.ok:
+            return None
+        page_state.data["fallback_from"] = summarize_tool_result(verification)
+        return page_state
 
     def _detect_page_change(
         self,
@@ -755,24 +851,14 @@ class ReActAgent:
         reuse_observation: Observation | None = None,
     ) -> Observation | ToolResult:
         try:
-            reused = reuse_observation is not None
-            observation_source = "cached observation" if reused else "OmniParser"
-            cache_state: dict[str, Any] = {"enabled": self.observation_cache is not None}
             if reuse_observation is None:
                 screenshot = self.desktop.capture(f"step_{index}_screenshot")
-                cache_context = self._observation_cache_context(
+                return self._observation_from_screenshot(
+                    index,
                     step_number=step_number if step_number is not None else index,
-                    screenshot=screenshot,
                     current_instruction=current_instruction,
+                    screenshot=screenshot,
                 )
-                cached = self._try_observation_cache(cache_context, screenshot, current_instruction=current_instruction)
-                if cached is not None:
-                    elements, cache_state = cached
-                    reused = True
-                    observation_source = "observation cache"
-                else:
-                    elements = self.ui_parser.parse(screenshot, task_instruction=current_instruction)
-                    cache_state = self._write_observation_cache(cache_context, screenshot, elements)
             else:
                 if not reuse_observation.screenshot_path:
                     return ToolResult(False, "OBSERVE_REUSE_FAILED", "Cached observation has no screenshot path.")
@@ -787,8 +873,60 @@ class ReActAgent:
                     reuse_observation.elements,
                     task_instruction=current_instruction,
                 )
+                return self._build_observation(
+                    screenshot=screenshot,
+                    elements=elements,
+                    observation_source="cached observation",
+                    reused=True,
+                    cache_state={"enabled": self.observation_cache is not None},
+                )
         except Exception as exc:
             return ToolResult(False, "OBSERVE_FAILED", str(exc))
+
+    def _observation_from_screenshot(
+        self,
+        index: int,
+        *,
+        step_number: int,
+        current_instruction: str,
+        screenshot: ImageInfo,
+    ) -> Observation | ToolResult:
+        try:
+            reused = False
+            observation_source = "OmniParser"
+            cache_state: dict[str, Any] = {"enabled": self.observation_cache is not None}
+            cache_context = self._observation_cache_context(
+                step_number=step_number,
+                screenshot=screenshot,
+                current_instruction=current_instruction,
+            )
+            cached = self._try_observation_cache(cache_context, screenshot, current_instruction=current_instruction)
+            if cached is not None:
+                elements, cache_state = cached
+                reused = True
+                observation_source = "observation cache"
+            else:
+                elements = self.ui_parser.parse(screenshot, task_instruction=current_instruction)
+                cache_state = self._write_observation_cache(cache_context, screenshot, elements)
+            return self._build_observation(
+                screenshot=screenshot,
+                elements=elements,
+                observation_source=observation_source,
+                reused=reused,
+                cache_state=cache_state,
+            )
+        except Exception as exc:
+            return ToolResult(False, "OBSERVE_FAILED", str(exc))
+
+    def _build_observation(
+        self,
+        *,
+        screenshot: ImageInfo,
+        elements: list,
+        observation_source: str,
+        reused: bool,
+        cache_state: dict[str, Any],
+    ) -> Observation:
         interactive_count = sum(1 for element in elements if element.interactive)
         return Observation(
             summary=(
@@ -1015,6 +1153,76 @@ def _actions_from_decision(decision) -> list:
         return actions
     action = getattr(decision, "action", None)
     return [action] if action is not None else []
+
+
+def _page_state_target_id(current_step) -> str | None:
+    text = f"{getattr(current_step, 'action_text', '')} {getattr(current_step, 'verification_text', '')}".lower()
+    number = getattr(current_step, "number", None)
+    if number == 0 and "home" in text:
+        return "home"
+    if "home" in text and ("确保" in text or "处于" in text or "回到" in text):
+        return "home"
+    return None
+
+
+def _local_decision_from_action_hints(action_sequence_hint: list, observation: Observation) -> ReasonerDecision | None:
+    for hint in action_sequence_hint:
+        if not _is_ellipsis_click_hint(hint):
+            continue
+        element = _find_ellipsis_button(observation.elements)
+        if element is None:
+            continue
+        action = AgentAction(
+            "click",
+            element.idx,
+            {
+                "local_resolver": "ellipsis_button",
+                "target_hint": getattr(hint, "target_hint", ""),
+                "selected_content": element.content,
+                "selected_center": list(element.center),
+            },
+        )
+        return ReasonerDecision(
+            thought="Local resolver selected the ellipsis/browse button.",
+            action=action,
+            actions=[action],
+        )
+    return None
+
+
+def _is_ellipsis_click_hint(hint) -> bool:
+    action = str(getattr(hint, "action", "") or "").strip().lower()
+    target_hint = str(getattr(hint, "target_hint", "") or "").strip().lower()
+    raw = str(getattr(hint, "raw", "") or "").strip().lower()
+    if action != "click":
+        return False
+    return target_hint in {"...", "…"} or "`...`" in raw or "..." in raw or "…" in raw
+
+
+def _find_ellipsis_button(elements: list) -> Any | None:
+    candidates = [element for element in elements if _is_ellipsis_button_candidate(element)]
+    if not candidates:
+        return None
+    return min(candidates, key=_ellipsis_button_score)
+
+
+def _is_ellipsis_button_candidate(element) -> bool:
+    content = _normalize_local_text(getattr(element, "content", "") or "")
+    return content in {"...", "…", "more"} or content.endswith(" more")
+
+
+def _ellipsis_button_score(element) -> tuple:
+    content = _normalize_local_text(getattr(element, "content", "") or "")
+    x1, y1, x2, y2 = getattr(element, "pixel_bbox", (0, 0, 0, 0))
+    width = max(0, x2 - x1)
+    height = max(0, y2 - y1)
+    exact_rank = 0 if content in {"...", "…"} else 1 if content == "more" else 2
+    size_rank = 0 if width <= 140 and height <= 80 else 1
+    return exact_rank, size_rank, y1, x1
+
+
+def _normalize_local_text(value: str) -> str:
+    return " ".join(str(value or "").strip().lower().split())
 
 
 def _local_window_transition_verification(

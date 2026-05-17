@@ -5,6 +5,7 @@ import {
   Eye,
   KeyRound,
   ListChecks,
+  Pin,
   Play,
   RotateCcw,
   Settings,
@@ -122,10 +123,17 @@ export function App() {
   const [omniParserStatus, setOmniParserStatus] = useState<OmniParserStatus>(idleOmniParserStatus);
   const [omniParserBusy, setOmniParserBusy] = useState(false);
   const [omniParserError, setOmniParserError] = useState<string | null>(null);
+  const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const [alwaysOnTopAvailable, setAlwaysOnTopAvailable] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const activeLogRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    const desktopWindow = window.desktopWindow;
+    if (desktopWindow) {
+      setAlwaysOnTopAvailable(true);
+      void desktopWindow.getAlwaysOnTop().then(setAlwaysOnTop);
+    }
     void refreshBackend();
     const interval = window.setInterval(() => {
       void refreshStatus();
@@ -379,6 +387,14 @@ export function App() {
     setVision(next);
   }
 
+  async function toggleAlwaysOnTop() {
+    if (!window.desktopWindow) {
+      return;
+    }
+    const next = await window.desktopWindow.setAlwaysOnTop(!alwaysOnTop);
+    setAlwaysOnTop(next);
+  }
+
   return (
     <div className="app-shell">
       <header className="titlebar">
@@ -405,6 +421,19 @@ export function App() {
             );
           })}
         </nav>
+        <div className="window-actions">
+          <button
+            aria-label={alwaysOnTop ? "取消窗口置顶" : "窗口置顶"}
+            aria-pressed={alwaysOnTop}
+            className={alwaysOnTop ? "titlebar-icon-button active" : "titlebar-icon-button"}
+            disabled={!alwaysOnTopAvailable}
+            onClick={() => void toggleAlwaysOnTop()}
+            title={alwaysOnTop ? "取消置顶" : "置顶窗口"}
+            type="button"
+          >
+            <Pin size={16} />
+          </button>
+        </div>
       </header>
 
       <main className="content">

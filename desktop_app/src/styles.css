@@ -16,7 +16,6 @@
 
 body {
   margin: 0;
-  min-width: 1080px;
   min-height: 100vh;
 }
 
@@ -42,7 +41,7 @@ button:disabled {
 
 .titlebar {
   display: grid;
-  grid-template-columns: 320px 1fr;
+  grid-template-columns: 320px 1fr auto;
   align-items: stretch;
   height: 72px;
   border-bottom: 1px solid #d7dce2;
@@ -104,6 +103,37 @@ button:disabled {
   color: #006fda;
 }
 
+.window-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px;
+  border-left: 1px solid #e2e6ea;
+}
+
+.titlebar-icon-button {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 1px solid #d4dae1;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #4e5965;
+}
+
+.titlebar-icon-button:hover:not(:disabled) {
+  border-color: #9fc9f2;
+  background: #f3f8ff;
+  color: #0a67c7;
+}
+
+.titlebar-icon-button.active {
+  border-color: #0a84ff;
+  background: #eaf4ff;
+  color: #006fda;
+}
+
 .content {
   padding: 28px 36px 32px;
 }
@@ -153,11 +183,11 @@ button:disabled {
 }
 
 .workspace-grid {
-  grid-template-columns: 306px minmax(740px, 1fr);
+  grid-template-columns: 306px minmax(0, 1fr);
 }
 
 .settings-layout {
-  grid-template-columns: 194px minmax(760px, 1fr);
+  grid-template-columns: 194px minmax(0, 1fr);
   align-items: start;
 }
 
@@ -173,7 +203,6 @@ button:disabled {
 }
 
 .task-panel {
-  min-height: 650px;
   padding: 16px 12px 14px;
 }
 
@@ -207,6 +236,9 @@ button:disabled {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  max-height: 64px;
+  overflow-y: auto;
+  padding-right: 2px;
 }
 
 .empty-state {
@@ -734,17 +766,13 @@ button:disabled {
 }
 
 @media (max-width: 1180px) {
-  body {
-    min-width: 960px;
-  }
-
   .content {
     padding: 20px;
   }
 
   .workspace-grid,
   .settings-layout {
-    grid-template-columns: 280px minmax(620px, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .model-strip,
